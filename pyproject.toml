@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tamako"
+version = "0.1.0"
+description = "撮影素材を撮影順に並べ、不要区間を切り、顔をPNGで隠し、字幕を付けるまでの自動編集パイプライン"
+requires-python = ">=3.9"
+dependencies = [
+    "imageio-ffmpeg>=0.5.1",
+    "opencv-python-headless>=4.9",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+subtitle = ["faster-whisper>=1.0"]
+
+[project.scripts]
+tamako = "tamako.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
