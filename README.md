@@ -236,6 +236,8 @@ src/tamako/
   cli.py         コマンド行の入口
 ```
 
+顔の取りこぼしを減らすための計画は `docs/face-coverage-plan.md` にまとめてあります。
+
 試験を走らせる:
 
 ```
