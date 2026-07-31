@@ -22,22 +22,9 @@ from .frames import FrameWriter, even, fit_filters, read_frames, scaled_size
 from .ordering import Clip
 from .overlay import MaskTracker, composite, load_mask
 from .segments import CutPlan
+from .timeline import Segment, Timeline, build_timeline
 
 ProgressFn = Callable[[str, float], None]
-
-
-@dataclass
-class Segment:
-    """出力に載せる 1 区間。どの素材のどこから来たかを保持する。"""
-
-    clip: Clip
-    start: float
-    end: float
-    out_start: float = 0.0
-
-    @property
-    def duration(self) -> float:
-        return self.end - self.start
 
 
 @dataclass
@@ -77,18 +64,6 @@ def choose_geometry(clips: Sequence[Clip]) -> Geometry:
     return Geometry(width=even(width), height=even(height), fps=float(fps) or 30.0)
 
 
-def build_segments(clip_plans: Sequence[Tuple[Clip, CutPlan]]) -> List[Segment]:
-    """素材ごとの残す区間を、出力上の通し時刻付きで一列に並べる。"""
-    segments: List[Segment] = []
-    cursor = 0.0
-    for clip, plan in clip_plans:
-        for start, end in plan.keep:
-            segment = Segment(clip=clip, start=start, end=end, out_start=cursor)
-            segments.append(segment)
-            cursor += segment.duration
-    return segments
-
-
 def _detect_scaled(
     detector: FaceDetector, frame: np.ndarray, detect_width: Optional[int]
 ) -> List[FaceBox]:
@@ -105,7 +80,11 @@ def _detect_scaled(
 def _build_audio(
     segments: Sequence[Segment], out_path: Path, *, bitrate: str = "192k"
 ) -> None:
-    """区間の音声を切り出して繋ぐ。音の無い素材は無音で埋める。"""
+    """区間の音声を切り出して繋ぐ。音の無い素材は無音で埋める。
+
+    トリム長は必ず「確定したフレーム数 ÷ fps」から取る。素材の秒数 (end-start)
+    で切ると、映像側（フレーム数の連結）との差が区間ごとに累積して音がずれる。
+    """
     inputs: List[Path] = []
     index_of: Dict[Path, int] = {}
     for segment in segments:
@@ -122,9 +101,11 @@ def _build_audio(
         if segment.clip.info.has_audio:
             source = index_of[segment.clip.path]
             lines.append(
-                f"[{source}:a]atrim=start={segment.start:.6f}:end={segment.end:.6f},"
+                f"[{source}:a]atrim=start={segment.start:.6f}"
+                f":end={segment.start + segment.duration:.6f},"
                 f"asetpts=N/SR/TB,aresample=48000,"
-                f"aformat=sample_fmts=fltp:channel_layouts=stereo[{label}]"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"apad,atrim=duration={segment.duration:.6f}[{label}]"
             )
         else:
             lines.append(
@@ -183,14 +164,15 @@ def render(
     on_progress: Optional[ProgressFn] = None,
 ) -> RenderReport:
     """カット・顔隠し・音声結合を行い、1 本の動画として書き出す。"""
-    segments = build_segments(clip_plans)
+    geometry = choose_geometry([clip for clip, _ in clip_plans])
+    timeline = build_timeline(clip_plans, geometry.fps)
+    segments = timeline.segments
     if not segments:
         raise ValueError(
             "残す区間がひとつもありません。cut.mode を 'both' にする、"
             "silence_db を下げる、min_keep_sec を小さくする、などを試してください。"
         )
 
-    geometry = choose_geometry([clip for clip, _ in clip_plans])
     mask_image = load_mask(mask_path)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -200,8 +182,8 @@ def render(
     temp_video = work / "video_masked.mp4"
     temp_audio = work / "audio_cut.m4a"
 
-    report = RenderReport(output=output, geometry=geometry, segments=segments)
-    total_expected = sum(s.duration for s in segments) * geometry.fps
+    report = RenderReport(output=output, geometry=geometry, segments=list(segments))
+    total_expected = timeline.total_frames
     hold_frames = max(0, int(round(hold_sec * geometry.fps)))
     step = max(1, int(detect_every_n_frames))
 
@@ -231,6 +213,7 @@ def render(
                 filters=filters,
                 start=segment.start,
                 duration=segment.duration,
+                expected_frames=segment.frames,
             )
             # カットの前後で場面が飛ぶので、追従は区間ごとに作り直す。
             tracker = MaskTracker(hold_frames=hold_frames)
