@@ -34,6 +34,30 @@ class Geometry:
     fps: float
 
 
+class IntervalCollector:
+    """フレーム単位の出来事を区間（サイト）に畳む。
+
+    時刻を 1 個ずつリストに積むと、人が写っていない 10 分の素材で 18000 個の
+    float になり、報告としても読めない。人が見る単位は区間なので、連続する
+    フレームはここでまとめる。
+    """
+
+    def __init__(self, fps: float) -> None:
+        self._fps = fps
+        self._gap = 1.5 / fps  # 1 フレーム強の途切れは同じ区間とみなす
+        self.intervals: List[List[float]] = []
+
+    def add(self, timestamp: float) -> None:
+        if self.intervals and timestamp - self.intervals[-1][1] <= self._gap:
+            self.intervals[-1][1] = timestamp
+        else:
+            self.intervals.append([timestamp, timestamp])
+
+    def as_tuples(self) -> List[Tuple[float, float]]:
+        # 1 フレームの区間も長さを持たせる（end はそのフレームの終わり）。
+        return [(s, e + 1.0 / self._fps) for s, e in self.intervals]
+
+
 @dataclass
 class RenderReport:
     """書き出し結果と、人が見返すべき箇所の記録。"""
@@ -45,14 +69,20 @@ class RenderReport:
     frames_total: int = 0
     frames_with_mask: int = 0
     frames_held: int = 0
-    frames_no_face: List[float] = field(default_factory=list)
-    low_confidence: List[Tuple[float, float]] = field(default_factory=list)
+    # どちらも出力時刻の区間。フレーム単位の生記録は持たない。
+    no_face_intervals: List[Tuple[float, float]] = field(default_factory=list)
+    low_confidence_intervals: List[Tuple[float, float]] = field(default_factory=list)
+    effective_mask_scale: float = 0.0
 
     @property
     def mask_coverage(self) -> float:
         if self.frames_total == 0:
             return 0.0
         return self.frames_with_mask / self.frames_total
+
+    @property
+    def longest_no_face_sec(self) -> float:
+        return max((e - s for s, e in self.no_face_intervals), default=0.0)
 
 
 def choose_geometry(clips: Sequence[Clip]) -> Geometry:
@@ -187,6 +217,16 @@ def render(
     hold_frames = max(0, int(round(hold_sec * geometry.fps)))
     step = max(1, int(detect_every_n_frames))
 
+    # マスクの透明部分（丸・星型ステッカーの角）から顔が出ないよう、
+    # 実効被覆で scale を自動補正する。人に判断させない。
+    from .overlay import effective_scale
+
+    scale_eff = effective_scale(mask_scale, mask_image)
+    report.effective_mask_scale = scale_eff
+
+    no_face = IntervalCollector(geometry.fps)
+    low_conf = IntervalCollector(geometry.fps)
+
     with FrameWriter(
         temp_video,
         width=geometry.width,
@@ -221,32 +261,25 @@ def render(
 
             for local_index, frame in enumerate(frames):
                 frame = frame.copy()  # ffmpeg のバッファは読み取り専用
+                timestamp = segment.out_start + local_index / geometry.fps
                 if local_index % step == 0:
                     boxes = _detect_scaled(detector, frame, detect_width)
                     drawn = tracker.update(boxes)
                     if not boxes and drawn:
                         report.frames_held += 1
-                    for box in boxes:
-                        if box.score < low_score_warn:
-                            report.low_confidence.append(
-                                (segment.out_start + local_index / geometry.fps, box.score)
-                            )
+                    if any(box.score < low_score_warn for box in boxes):
+                        low_conf.add(timestamp)
 
-                timestamp = segment.out_start + local_index / geometry.fps
                 if drawn:
                     report.frames_with_mask += 1
                     for box in drawn:
                         composite(
                             frame,
                             mask_image,
-                            box.expanded(
-                                mask_scale,
-                                (geometry.width, geometry.height),
-                                offset_y=mask_offset_y,
-                            ),
+                            box.expanded(scale_eff, offset_y=mask_offset_y),
                         )
                 else:
-                    report.frames_no_face.append(round(timestamp, 3))
+                    no_face.add(timestamp)
 
                 writer.write(frame)
                 report.frames_total += 1
@@ -260,6 +293,8 @@ def render(
     _mux(temp_video, temp_audio, output)
 
     report.duration = report.frames_total / geometry.fps
+    report.no_face_intervals = no_face.as_tuples()
+    report.low_confidence_intervals = low_conf.as_tuples()
     temp_video.unlink(missing_ok=True)
     temp_audio.unlink(missing_ok=True)
     try:

@@ -72,7 +72,7 @@ def analyze_clips(
             source_fps=clip.info.fps,
             detector=detector,
             sample_fps=sample_fps,
-            detect_width=int(config.section("mask")["detect_width"]) or None,
+            detect_width=int(cut["detect_width"]) or None,
         )
         face_present = samples_to_intervals(
             times, step=1.0 / sample_fps, hold=float(cut["face_hold_sec"])

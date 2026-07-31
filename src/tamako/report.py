@@ -63,14 +63,11 @@ def write_json_report(
             "frames_without_mask": render_report.frames_total - render_report.frames_with_mask,
             "coverage": round(render_report.mask_coverage, 4),
             "frames_held_after_lost_detection": render_report.frames_held,
-            "low_confidence_detections": [
-                {"time": round(t, 3), "time_tc": timecode(t), "score": round(s, 3)}
-                for t, s in render_report.low_confidence[:500]
-            ],
-            "times_without_any_face": [
-                {"time": t, "time_tc": timecode(t)}
-                for t in render_report.frames_no_face[:500]
-            ],
+            "effective_mask_scale": round(render_report.effective_mask_scale, 3),
+            # フレームの時刻の羅列ではなく区間で持つ。人が見る単位は区間。
+            "no_face_intervals": _intervals(render_report.no_face_intervals),
+            "longest_no_face_sec": round(render_report.longest_no_face_sec, 3),
+            "low_confidence_intervals": _intervals(render_report.low_confidence_intervals),
         },
         "clips": [
             {
@@ -147,6 +144,8 @@ def summarize(
     kept = render_report.duration
     ratio = (kept / original * 100.0) if original > 0 else 0.0
 
+    # 「99.8% を覆った」という割合は必ず「安全」と読み替えられてしまう。
+    # 割合ではなく、顔なし区間の件数と最長の長さ＝人が見に行くべき箇所を出す。
     lines = [
         "",
         "── 結果 ──────────────────────────────",
@@ -156,21 +155,21 @@ def summarize(
         f"{render_report.geometry.fps:g}fps",
         "",
         "── 顔隠しの確認 ──────────────────────",
-        f"  マスクを描いたフレーム: {render_report.frames_with_mask} / "
-        f"{render_report.frames_total} ({render_report.mask_coverage * 100:.1f}%)",
+        f"  何も隠していない区間: {len(render_report.no_face_intervals)} 箇所 "
+        f"(最長 {render_report.longest_no_face_sec:.1f} 秒)",
         f"  検出が途切れて直前位置で補ったフレーム: {render_report.frames_held}",
-        f"  確信度が低かった検出: {len(render_report.low_confidence)} 件",
+        f"  確信度が低かった区間: {len(render_report.low_confidence_intervals)} 箇所",
+        f"  マスクの実効倍率: {render_report.effective_mask_scale:.2f} "
+        "(mask.png の透明部分を考慮した補正後)",
     ]
 
-    uncovered = render_report.frames_total - render_report.frames_with_mask
-    if uncovered:
-        preview = ", ".join(timecode(t) for t in render_report.frames_no_face[:8])
-        lines += [
-            f"  顔をひとつも検出しなかったフレーム: {uncovered}",
-            f"    最初の数箇所: {preview}" if preview else "",
-        ]
+    if render_report.no_face_intervals:
+        preview = ", ".join(
+            f"{timecode(s)}-{timecode(e)}" for s, e in render_report.no_face_intervals[:6]
+        )
+        lines.append(f"    最初の数箇所: {preview}")
         lines.append(
-            "  ※ ここは何も隠れていません。顔が写っていないなら問題ありませんが、"
+            "  ※ 上記の区間は何も隠れていません。顔が写っていないなら問題ありませんが、"
         )
         lines.append(
             "     写っているのに検出できていない場合は顔が出たままです。必ず目視してください。"

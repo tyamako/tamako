@@ -40,8 +40,54 @@ def load_mask(path: str | Path) -> np.ndarray:
         alpha = np.full(image.shape[:2] + (1,), 255, dtype=np.uint8)
         image = np.concatenate([image, alpha], axis=2)
     if image.shape[2] != 4:
-        raise OverlayError(f"想定外のチャンネル数です ({image.shape[2]}): {target}")
+        raise OverlayError(f"想定外のチャンネル数です ({target.name}: {image.shape[2]} ch)")
     return image
+
+
+def effective_coverage(mask_rgba: np.ndarray) -> float:
+    """マスク中心に置ける最大の不透明矩形が、画像全体に占める割合（辺の比）。
+
+    実際に顔を隠すのは箱ではなく PNG の不透明画素なので、丸や星型のステッカーは
+    箱が顔を含んでいても角の透明部分から顔が出る。中心から矩形を広げていき、
+    不透明率 99% を保てる最大の大きさを二分探索で求める。円形ならおよそ 0.70。
+    """
+    alpha = mask_rgba[:, :, 3] >= 128
+    height, width = alpha.shape
+    if not alpha.any():
+        return 0.0
+    # 積分画像で任意矩形の不透明画素数を O(1) で数える。
+    integral = np.zeros((height + 1, width + 1), dtype=np.int64)
+    np.cumsum(np.cumsum(alpha, axis=0), axis=1, out=integral[1:, 1:])
+
+    def opaque_ratio(fraction: float) -> float:
+        half_w = max(1, int(width * fraction / 2))
+        half_h = max(1, int(height * fraction / 2))
+        cx, cy = width // 2, height // 2
+        x0, x1 = max(0, cx - half_w), min(width, cx + half_w)
+        y0, y1 = max(0, cy - half_h), min(height, cy + half_h)
+        count = int(integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0])
+        area = (x1 - x0) * (y1 - y0)
+        return count / area if area else 0.0
+
+    low, high = 0.0, 1.0
+    for _ in range(20):
+        mid = (low + high) / 2
+        if opaque_ratio(mid) >= 0.99:
+            low = mid
+        else:
+            high = mid
+    return low
+
+
+def effective_scale(scale: float, mask_rgba: np.ndarray, *, floor: float = 0.35) -> float:
+    """設定の scale を、マスクの実効被覆で補正した値にする。
+
+    「scale を 2.6 以上にすることを推奨」と人に判断させるのではなく、
+    判断を挟まず補正する。透明部分が極端に多い画像で補正が暴走しないよう、
+    被覆比には下限を設ける（それ以下は画像の選び直しを促すべき水準）。
+    """
+    coverage = effective_coverage(mask_rgba)
+    return scale / max(coverage, floor)
 
 
 def composite(frame: np.ndarray, mask_rgba: np.ndarray, box: FaceBox) -> None:
