@@ -301,6 +301,46 @@ def apply_uncovered_policy(
     return adjusted, collect_sites(adjusted, tracked, edits=edits, config=config), removed
 
 
+def subset_plans(
+    clip_plans: Sequence[Tuple[Clip, CutPlan]],
+    spans: dict,
+) -> List[Tuple[Clip, CutPlan]]:
+    """残す区間を、指定した素材時刻の範囲に絞った計画を作る。
+
+    確認用の抜き出し（remask）と部分書き出し（edit --only）の共通の土台。
+    素材から読み直すので、何度出しても画質は劣化しない。
+    """
+    from .segments import intersect, invert, merge
+
+    result: List[Tuple[Clip, CutPlan]] = []
+    for clip, plan in clip_plans:
+        wanted = merge(spans.get(clip.path, []))
+        if not wanted:
+            continue
+        keep = intersect(plan.keep, wanted)
+        if not keep:
+            continue
+        result.append((clip, replace(
+            plan, keep=keep, cut=invert(keep, clip.info.duration)
+        )))
+    return result
+
+
+def site_spans(sites: Sequence, *, margin: float = 1.5) -> dict:
+    """サイトの前後に余白を付けた素材時刻の範囲。
+
+    **粗い画質で全編を焼くのではなく、フル解像度で危ない箇所だけを焼く。**
+    実務で最も多い漏れは部分被覆（顎が数十 px 出ている等）で、720p に落とすと
+    そこが原理的に判別できない。削ってよい次元は空間ではなく時間。
+    """
+    spans: dict = {}
+    for site in sites:
+        spans.setdefault(site.clip, []).append(
+            (max(0.0, site.start - margin), site.end + margin)
+        )
+    return spans
+
+
 def describe_plans(clip_plans: Sequence[Tuple[Clip, CutPlan]]) -> str:
     """カット結果の下見。書き出す前に人が判断できるだけの情報を出す。"""
     from .report import timecode
