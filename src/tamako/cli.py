@@ -210,11 +210,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
     """並べる・切る・顔を隠す（前半の工程）。"""
     from .ordering import describe_order
     from .pipeline import (
-        analyze_clips, collect_clips, describe_plans, detection_work_dir,
-        run_detection, track_clips,
+        analyze_clips, apply_uncovered_policy, collect_clips, describe_plans,
+        detection_work_dir, run_detection, track_clips,
     )
     from .render import render
     from .report import summarize, write_cut_list_csv, write_json_report
+    from .sites import describe_sites, summarize_sites
 
     config = _load(args)
     mask_path = config.mask_image
@@ -246,6 +247,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
     tracked = track_clips(clips, config, detections, on_progress=_status)
     _clear_status()
 
+    plans, sites, removed = apply_uncovered_policy(plans, tracked, config)
+    if removed > 0:
+        _print(f"  覆えない区間を {removed:.2f}s 削りました（uncovered_policy: cut）")
+        _print("")
+
     report = render(
         plans,
         tracked,
@@ -267,18 +273,29 @@ def cmd_edit(args: argparse.Namespace) -> int:
         clip_plans=plans,
         render_report=report,
         settings={"cut": config.section("cut"), "mask": mask_cfg},
+        sites=sites,
     )
     csv_path = write_cut_list_csv(output_dir / "cut_list.csv", report)
 
     _print(summarize(plans, report))
     _print("")
+    _print(summarize_sites(sites, out_duration=report.duration))
+    if sites:
+        _print("")
+        _print("── 危険度の高い順 ────────────────────")
+        _print(describe_sites(sites))
+    _print("")
     _print("── 書き出したもの ────────────────────")
     _print(f"  {report.output}")
-    _print(f"  {csv_path}   （カット位置の一覧。Filmora で手直しする際の下敷き）")
-    _print(f"  {json_path}  （全記録）")
+    _print(f"  {csv_path}   （カット位置の一覧）")
+    _print(f"  {json_path}  （全記録・サイト一覧）")
     _print("")
-    _print("次の工程: 動画を見ながら声を録音し、その音声ファイルを用意してから")
-    _print(f"  tamako finish --video \"{report.output}\" --audio \"収録音声.wav\"")
+    if sites:
+        _print("次の工程: 上の箇所を確認し、直すところがあれば")
+        _print("  tamako fix --review")
+    else:
+        _print("次の工程: 動画を見ながら声を録音し、その音声ファイルを用意してから")
+        _print(f"  tamako finish --video \"{report.output}\" --audio \"収録音声.wav\"")
     return 0
 
 

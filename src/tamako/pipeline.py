@@ -170,6 +170,61 @@ def analyze_clips(
     return results
 
 
+def collect_sites(
+    clip_plans: Sequence[Tuple[Clip, CutPlan]],
+    tracked: dict,
+    *,
+    min_site_sec: float = 0.05,
+) -> list:
+    """全素材のサイトを危険度順に集める。"""
+    from .sites import build_sites
+
+    sites = []
+    for clip, plan in clip_plans:
+        track = tracked.get(clip.path)
+        if track is None:
+            continue
+        sites.extend(build_sites(
+            clip.path, track, plan.keep, plan.silent,
+            duration=clip.info.duration, min_site_sec=min_site_sec,
+        ))
+    sites.sort(key=lambda s: s.risk, reverse=True)
+    return sites
+
+
+def apply_uncovered_policy(
+    clip_plans: Sequence[Tuple[Clip, CutPlan]],
+    tracked: dict,
+    config: Config,
+) -> Tuple[List[Tuple[Clip, CutPlan]], list, float]:
+    """C-2。覆えない区間の扱いを適用し、(計画, サイト, 削った秒数) を返す。
+
+    cut は「フレームを間引く」ではなく「残す区間を削る」で実装する。
+    フレームを個別に落とすと映像の枚数と音声の秒数が食い違い、
+    時間軸の契約が壊れて全体が音ズレする。
+    """
+    from .sites import apply_cut_policy
+    from .segments import invert, total
+
+    policy = str(config.section("mask").get("uncovered_policy", "expand"))
+    sites = collect_sites(clip_plans, tracked)
+    if policy != "cut":
+        return list(clip_plans), sites, 0.0
+
+    min_keep = float(config.section("cut")["min_keep_sec"])
+    adjusted: List[Tuple[Clip, CutPlan]] = []
+    removed = 0.0
+    for clip, plan in clip_plans:
+        mine = [s for s in sites if s.clip == clip.path]
+        keep = apply_cut_policy(plan.keep, mine, min_keep_sec=min_keep)
+        removed += total(plan.keep) - total(keep)
+        adjusted.append((clip, replace(
+            plan, keep=keep, cut=invert(keep, clip.info.duration)
+        )))
+    # 削った後の状態でサイトを取り直す（削れた箇所はもう出力に出ない）。
+    return adjusted, collect_sites(adjusted, tracked), removed
+
+
 def describe_plans(clip_plans: Sequence[Tuple[Clip, CutPlan]]) -> str:
     """カット結果の下見。書き出す前に人が判断できるだけの情報を出す。"""
     from .report import timecode

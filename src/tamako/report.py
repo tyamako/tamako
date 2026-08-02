@@ -44,11 +44,16 @@ def write_json_report(
     clip_plans: Sequence[Tuple[Clip, CutPlan]],
     render_report: RenderReport,
     settings: Dict[str, object],
+    sites: Sequence = (),
 ) -> Path:
     """機械可読の全記録。あとから条件を変えて再現するための情報も含める。"""
+    from .sites import sites_to_json
+
     payload = {
-        "version": 1,
+        "version": 2,
         "settings": settings,
+        # 人が見るべき箇所。危険度順（時刻順ではない）。
+        "review_sites": sites_to_json(sites),
         "output": {
             "path": str(render_report.output),
             "duration": round(render_report.duration, 3),

@@ -377,10 +377,11 @@ def _dilate(dense: Dict[int, PlacedBox], config: TrackConfig) -> Dict[int, List[
         x1 = max(b.x + b.w for b in window)
         y1 = max(b.y + b.h for b in window)
         # 包む箱が元の箱に対して大きくなりすぎるなら、個別に描く。
+        # 由来は書き換えない。膨張は箱を広げるだけで、そのフレームで顔を
+        # 検出できた事実は変わらない。ここで dilate に書き換えると、
+        # 検出できているフレームまで「推定で覆っている」と報告されてしまう。
         if (x1 - x0) <= here.w * config.expand_limit and (y1 - y0) <= here.h * config.expand_limit:
-            source = here.source if here.source != SOURCE_DETECTED else SOURCE_DILATE
-            result[f] = [replace(here, x=x0, y=y0, w=x1 - x0, h=y1 - y0,
-                                 source=source if len(window) > 1 else here.source)]
+            result[f] = [replace(here, x=x0, y=y0, w=x1 - x0, h=y1 - y0)]
         else:
             result[f] = _dedupe(window)
     return result
