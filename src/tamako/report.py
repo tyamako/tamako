@@ -62,12 +62,12 @@ def write_json_report(
             "frames_with_mask": render_report.frames_with_mask,
             "frames_without_mask": render_report.frames_total - render_report.frames_with_mask,
             "coverage": round(render_report.mask_coverage, 4),
-            "frames_held_after_lost_detection": render_report.frames_held,
+            "frames_drawn_from_estimate": render_report.frames_estimated,
             "effective_mask_scale": round(render_report.effective_mask_scale, 3),
             # フレームの時刻の羅列ではなく区間で持つ。人が見る単位は区間。
             "no_face_intervals": _intervals(render_report.no_face_intervals),
             "longest_no_face_sec": round(render_report.longest_no_face_sec, 3),
-            "low_confidence_intervals": _intervals(render_report.low_confidence_intervals),
+            "uncertain_intervals": _intervals(render_report.uncertain_intervals),
         },
         "clips": [
             {
@@ -157,8 +157,8 @@ def summarize(
         "── 顔隠しの確認 ──────────────────────",
         f"  何も隠していない区間: {len(render_report.no_face_intervals)} 箇所 "
         f"(最長 {render_report.longest_no_face_sec:.1f} 秒)",
-        f"  検出が途切れて直前位置で補ったフレーム: {render_report.frames_held}",
-        f"  確信度が低かった区間: {len(render_report.low_confidence_intervals)} 箇所",
+        f"  推定で覆ったフレーム（補間・外挿・膨張）: {render_report.frames_estimated}",
+        f"  位置を保証できない区間: {len(render_report.uncertain_intervals)} 箇所",
         f"  マスクの実効倍率: {render_report.effective_mask_scale:.2f} "
         "(mask.png の透明部分を考慮した補正後)",
     ]

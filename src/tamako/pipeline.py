@@ -6,8 +6,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from .tracks import TrackConfig
 
 from .config import Config
 from .detect import detect_clips, load_detections
@@ -70,6 +74,48 @@ def run_detection(
         face_model=face_model,
         on_progress=on_progress,
     )
+
+
+def track_config(config: Config) -> "TrackConfig":
+    """設定から後処理の設定を組む。"""
+    from .tracks import TrackConfig
+
+    mask_cfg = config.section("mask")
+    fps_guess = 30.0
+    return TrackConfig(
+        score_threshold=float(mask_cfg["score_threshold"]),
+        dilate_frames=int(mask_cfg["dilate_frames"]),
+        extrap_frames=max(1, int(round(float(mask_cfg["hold_sec"]) * fps_guess))),
+        expand_per_velocity=float(mask_cfg["expand_per_velocity"]),
+        expand_limit=float(mask_cfg["expand_limit"]),
+    )
+
+
+def track_clips(
+    clips: Sequence[Clip],
+    config: Config,
+    detections: dict,
+    *,
+    on_progress: Optional[ProgressFn] = None,
+) -> dict:
+    """検出結果からトラックを組み、途切れを埋める。素材パス → TrackedClip。"""
+    from .tracks import track_clip
+
+    base = track_config(config)
+    result = {}
+    for clip in clips:
+        if on_progress:
+            on_progress(f"追従を計算中 [{clip.order + 1}/{len(clips)}] {clip.name}")
+        det = load_detections(detections[clip.path])
+        # hold_sec は秒で指定されるので、素材の実 fps でフレーム数に直す。
+        cfg = replace(
+            base,
+            extrap_frames=max(1, int(round(
+                float(config.section("mask")["hold_sec"]) * det.fps
+            ))),
+        )
+        result[clip.path] = track_clip(det, cfg)
+    return result
 
 
 def analyze_clips(

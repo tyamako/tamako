@@ -208,9 +208,11 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_edit(args: argparse.Namespace) -> int:
     """並べる・切る・顔を隠す（前半の工程）。"""
-    from .faces import FaceDetector, ensure_model
     from .ordering import describe_order
-    from .pipeline import analyze_clips, collect_clips, describe_plans
+    from .pipeline import (
+        analyze_clips, collect_clips, describe_plans, detection_work_dir,
+        run_detection, track_clips,
+    )
     from .render import render
     from .report import summarize, write_cut_list_csv, write_json_report
 
@@ -240,24 +242,23 @@ def cmd_edit(args: argparse.Namespace) -> int:
     output_dir = config.output_dir
     output_path = output_dir / args.name
 
-    detector = FaceDetector(
-        ensure_model(args.face_model), score_threshold=float(mask_cfg["score_threshold"])
-    )
+    detections = run_detection(clips, config, face_model=args.face_model)
+    tracked = track_clips(clips, config, detections, on_progress=_status)
+    _clear_status()
+
     report = render(
         plans,
+        tracked,
         output_path=output_path,
         mask_path=mask_path,
-        detector=detector,
         mask_scale=float(mask_cfg["scale"]),
         mask_offset_y=float(mask_cfg.get("offset_y", 0.0)),
-        hold_sec=float(mask_cfg["hold_sec"]),
-        detect_width=int(mask_cfg["detect_width"]) or None,
-        detect_every_n_frames=int(mask_cfg["detect_every_n_frames"]),
-        low_score_warn=float(mask_cfg["low_score_warn"]),
         crf=int(encode_cfg["crf"]),
         preset=str(encode_cfg["preset"]),
         pix_fmt=str(encode_cfg["pix_fmt"]),
         audio_bitrate=str(encode_cfg["audio_bitrate"]),
+        diagnostic=getattr(args, "diagnostic", False),
+        work_dir=detection_work_dir(config),
         on_progress=_progress_line,
     )
 
@@ -442,6 +443,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_edit = subparsers.add_parser("edit", parents=[common, folders],
                                    help="並べる・切る・顔を隠す")
     p_edit.add_argument("--name", default="edited.mp4", help="出力ファイル名（既定: edited.mp4）")
+    p_edit.add_argument("--diagnostic", action="store_true",
+                        help="マスクの代わりに覆う範囲と由来を描く（位置合わせの確認用）")
     p_edit.set_defaults(func=cmd_edit)
 
     p_tr = subparsers.add_parser("transcribe", parents=[common],

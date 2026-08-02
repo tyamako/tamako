@@ -47,10 +47,21 @@ DEFAULTS: Dict[str, Any] = {
         # 重ねる位置の上下微調整（顔の高さに対する割合、負で上）。
         # 髪が多い人は少し上げるとよいが、下げすぎると顎が出る。
         "offset_y": 0.0,
+        # 検出が途切れたとき、直前の位置から外挿し続ける長さ。
         "hold_sec": 0.7,
         "detect_width": 640,
-        "detect_every_n_frames": 1,
-        "low_score_warn": 0.75,
+        # 前後これだけのフレームの箱を取り込む（素朴な保険）。0 で無効。
+        # 補間・外挿が効いているぶん、ここは小さくてよい。大きくすると
+        # 動く人の軌跡ぜんぶを覆うことになり、過剰マスクが急に増える。
+        "dilate_frames": 2,
+        # 推定の不確かさを箱の大きさで吸収する強さ。
+        # 広げる半径[px] = expand_per_velocity × 速度[px/秒] × 経過[秒]
+        "expand_per_velocity": 0.5,
+        # 広げる上限（倍）。ここに達した箱は「位置を保証できない」印が付き、
+        # uncovered_policy の判断に回る。
+        "expand_limit": 4.0,
+        # 覆えないフレームの扱い: expand / cut / warn（ぼかしは使わない）
+        "uncovered_policy": "expand",
     },
     "encode": {
         "crf": 20,

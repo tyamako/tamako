@@ -1,5 +1,9 @@
 """カットした区間を繋ぎ、顔を隠して 1 本に書き出す。
 
+検出はここではしない。`detect` が素材時間軸で全フレーム検出し、`tracks` が
+途切れを埋めた結果を受け取って、貼るだけにしてある。おかげで
+「マスクの大きさだけ変えて出し直す」が再検出なしでできる。
+
 映像は Python 側でフレームごとに合成する必要があるため生フレームで扱うが、
 音声は ffmpeg のフィルタだけで完結するので触らない。映像の符号化は 1 回で
 済ませてある（切ってから重ねる、で 2 回符号化すると画質と時間を損なう）。
@@ -16,13 +20,13 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from .faces import FaceBox, FaceDetector
 from .ffmpeg import find_ffmpeg, run
-from .frames import FrameWriter, even, fit_filters, read_frames, scaled_size
+from .frames import FrameWriter, even, fit_filters, read_frames
 from .ordering import Clip
-from .overlay import MaskTracker, composite, load_mask
+from .overlay import composite, effective_scale, load_mask
 from .segments import CutPlan
 from .timeline import Segment, Timeline, build_timeline
+from .tracks import SOURCE_DETECTED, PlacedBox, TrackedClip
 
 ProgressFn = Callable[[str, float], None]
 
@@ -54,7 +58,6 @@ class IntervalCollector:
             self.intervals.append([timestamp, timestamp])
 
     def as_tuples(self) -> List[Tuple[float, float]]:
-        # 1 フレームの区間も長さを持たせる（end はそのフレームの終わり）。
         return [(s, e + 1.0 / self._fps) for s, e in self.intervals]
 
 
@@ -68,10 +71,10 @@ class RenderReport:
     duration: float = 0.0
     frames_total: int = 0
     frames_with_mask: int = 0
-    frames_held: int = 0
-    # どちらも出力時刻の区間。フレーム単位の生記録は持たない。
+    frames_estimated: int = 0
+    # いずれも出力時刻の区間。フレーム単位の生記録は持たない。
     no_face_intervals: List[Tuple[float, float]] = field(default_factory=list)
-    low_confidence_intervals: List[Tuple[float, float]] = field(default_factory=list)
+    uncertain_intervals: List[Tuple[float, float]] = field(default_factory=list)
     effective_mask_scale: float = 0.0
 
     @property
@@ -94,17 +97,29 @@ def choose_geometry(clips: Sequence[Clip]) -> Geometry:
     return Geometry(width=even(width), height=even(height), fps=float(fps) or 30.0)
 
 
-def _detect_scaled(
-    detector: FaceDetector, frame: np.ndarray, detect_width: Optional[int]
-) -> List[FaceBox]:
-    """必要なら縮小して検出し、座標を元の大きさに戻す。"""
-    height, width = frame.shape[:2]
-    if not detect_width or detect_width >= width:
-        return detector.detect(frame)
-    small_w, small_h = scaled_size(width, height, detect_width)
-    small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
-    factor = width / float(small_w)
-    return [box.scaled(factor) for box in detector.detect(small)]
+def source_to_output(
+    src_w: int, src_h: int, out_w: int, out_h: int
+) -> Tuple[float, float, float]:
+    """素材ピクセル → 出力ピクセル の変換 (倍率, x オフセット, y オフセット)。
+
+    fit_filters が縦横比を保って縮小し、余白を中央寄せで足すので、その逆算。
+    検出結果は素材座標で持ってあるため、描く直前にここを通す。
+    """
+    if src_w <= 0 or src_h <= 0:
+        return 1.0, 0.0, 0.0
+    ratio = min(out_w / src_w, out_h / src_h)
+    scaled_w, scaled_h = src_w * ratio, src_h * ratio
+    return ratio, (out_w - scaled_w) / 2.0, (out_h - scaled_h) / 2.0
+
+
+def _place(box: PlacedBox, ratio: float, dx: float, dy: float,
+           scale: float, offset_y: float) -> Tuple[float, float, float, float]:
+    """箱を出力座標に移し、マスクの倍率と上下補正を掛けた矩形にする。"""
+    cx = (box.x + box.w / 2) * ratio + dx
+    cy = (box.y + box.h / 2) * ratio + dy
+    w, h = box.w * ratio * scale, box.h * ratio * scale
+    cy += box.h * ratio * offset_y
+    return cx - w / 2, cy - h / 2, w, h
 
 
 def _build_audio(
@@ -176,20 +191,18 @@ def _mux(video: Path, audio: Path, out_path: Path) -> None:
 
 def render(
     clip_plans: Sequence[Tuple[Clip, CutPlan]],
+    tracked: Dict[Path, TrackedClip],
     *,
     output_path: str | Path,
     mask_path: str | Path,
-    detector: FaceDetector,
     mask_scale: float = 2.0,
     mask_offset_y: float = 0.0,
-    hold_sec: float = 0.7,
-    detect_width: Optional[int] = 640,
-    detect_every_n_frames: int = 1,
-    low_score_warn: float = 0.75,
     crf: int = 20,
     preset: str = "medium",
     pix_fmt: str = "yuv420p",
     audio_bitrate: str = "192k",
+    diagnostic: bool = False,
+    draw_log: Optional[Path] = None,
     work_dir: Optional[Path] = None,
     on_progress: Optional[ProgressFn] = None,
 ) -> RenderReport:
@@ -209,83 +222,97 @@ def render(
 
     work = Path(work_dir) if work_dir else output.parent / ".tamako_work"
     work.mkdir(parents=True, exist_ok=True)
-    temp_video = work / "video_masked.mp4"
-    temp_audio = work / "audio_cut.m4a"
+    temp_video = work / f"video_{output.stem}.mp4"
+    temp_audio = work / f"audio_{output.stem}.m4a"
 
     report = RenderReport(output=output, geometry=geometry, segments=list(segments))
     total_expected = timeline.total_frames
-    hold_frames = max(0, int(round(hold_sec * geometry.fps)))
-    step = max(1, int(detect_every_n_frames))
 
     # マスクの透明部分（丸・星型ステッカーの角）から顔が出ないよう、
     # 実効被覆で scale を自動補正する。人に判断させない。
-    from .overlay import effective_scale
-
     scale_eff = effective_scale(mask_scale, mask_image)
     report.effective_mask_scale = scale_eff
 
     no_face = IntervalCollector(geometry.fps)
-    low_conf = IntervalCollector(geometry.fps)
+    uncertain = IntervalCollector(geometry.fps)
+    log_handle = draw_log.open("w", encoding="utf-8") if draw_log else None
 
-    with FrameWriter(
-        temp_video,
-        width=geometry.width,
-        height=geometry.height,
-        fps=geometry.fps,
-        crf=crf,
-        preset=preset,
-        pix_fmt=pix_fmt,
-    ) as writer:
-        produced = 0
-        for segment in segments:
-            filters = fit_filters(
-                segment.clip.info.width,
-                segment.clip.info.height,
-                geometry.width,
-                geometry.height,
-                fps=geometry.fps,
-            )
-            _, frames = read_frames(
-                segment.clip.path,
-                out_width=geometry.width,
-                out_height=geometry.height,
-                fps=geometry.fps,
-                filters=filters,
-                start=segment.start,
-                duration=segment.duration,
-                expected_frames=segment.frames,
-            )
-            # カットの前後で場面が飛ぶので、追従は区間ごとに作り直す。
-            tracker = MaskTracker(hold_frames=hold_frames)
-            drawn: List[FaceBox] = []
+    try:
+        with FrameWriter(
+            temp_video,
+            width=geometry.width,
+            height=geometry.height,
+            fps=geometry.fps,
+            crf=crf,
+            preset=preset,
+            pix_fmt=pix_fmt,
+        ) as writer:
+            produced = 0
+            for segment in segments:
+                filters = fit_filters(
+                    segment.clip.info.width,
+                    segment.clip.info.height,
+                    geometry.width,
+                    geometry.height,
+                    fps=geometry.fps,
+                )
+                _, frames = read_frames(
+                    segment.clip.path,
+                    out_width=geometry.width,
+                    out_height=geometry.height,
+                    fps=geometry.fps,
+                    filters=filters,
+                    start=segment.start,
+                    duration=segment.duration,
+                    expected_frames=segment.frames,
+                )
+                clip_tracks = tracked.get(segment.clip.path)
+                ratio, dx, dy = source_to_output(
+                    segment.clip.info.width, segment.clip.info.height,
+                    geometry.width, geometry.height,
+                )
 
-            for local_index, frame in enumerate(frames):
-                frame = frame.copy()  # ffmpeg のバッファは読み取り専用
-                timestamp = segment.out_start + local_index / geometry.fps
-                if local_index % step == 0:
-                    boxes = _detect_scaled(detector, frame, detect_width)
-                    drawn = tracker.update(boxes)
-                    if not boxes and drawn:
-                        report.frames_held += 1
-                    if any(box.score < low_score_warn for box in boxes):
-                        low_conf.add(timestamp)
+                for local_index, frame in enumerate(frames):
+                    frame = frame.copy()  # ffmpeg のバッファは読み取り専用
+                    out_index = segment.out_start_frame + local_index
+                    timestamp = out_index / geometry.fps
+                    pts = segment.source_pts(local_index)
+                    boxes = clip_tracks.at_pts(pts) if clip_tracks else []
 
-                if drawn:
-                    report.frames_with_mask += 1
-                    for box in drawn:
-                        composite(
-                            frame,
-                            mask_image,
-                            box.expanded(scale_eff, offset_y=mask_offset_y),
+                    if boxes:
+                        report.frames_with_mask += 1
+                        if any(b.source != SOURCE_DETECTED for b in boxes):
+                            report.frames_estimated += 1
+                        if any(b.uncertain for b in boxes):
+                            uncertain.add(timestamp)
+                    else:
+                        no_face.add(timestamp)
+
+                    for box in boxes:
+                        x, y, w, h = _place(box, ratio, dx, dy, scale_eff, mask_offset_y)
+                        if diagnostic:
+                            _draw_diagnostic(frame, mask_image, box, x, y, w, h)
+                        else:
+                            composite(frame, mask_image,
+                                      _Rect(x=x, y=y, w=w, h=h))
+
+                    if log_handle is not None:
+                        parts = ";".join(
+                            f"{b.track_id},{b.source},{b.x:.1f},{b.y:.1f},{b.w:.1f},{b.h:.1f}"
+                            for b in boxes
                         )
-                else:
-                    no_face.add(timestamp)
+                        log_handle.write(
+                            f"{out_index}\t{segment.clip.path.name}\t{pts:.6f}\t{parts}\n"
+                        )
 
-                writer.write(frame)
-                report.frames_total += 1
-                produced += 1
-                if on_progress and produced % 30 == 0 and total_expected > 0:
-                    on_progress("顔を隠して書き出し中", min(1.0, produced / total_expected))
+                    writer.write(frame)
+                    report.frames_total += 1
+                    produced += 1
+                    if on_progress and produced % 30 == 0 and total_expected > 0:
+                        on_progress("顔を隠して書き出し中", min(1.0, produced / total_expected))
+    finally:
+        if log_handle is not None:
+            log_handle.close()
 
     if on_progress:
         on_progress("音声を結合中", 1.0)
@@ -294,7 +321,7 @@ def render(
 
     report.duration = report.frames_total / geometry.fps
     report.no_face_intervals = no_face.as_tuples()
-    report.low_confidence_intervals = low_conf.as_tuples()
+    report.uncertain_intervals = uncertain.as_tuples()
     temp_video.unlink(missing_ok=True)
     temp_audio.unlink(missing_ok=True)
     try:
@@ -302,3 +329,48 @@ def render(
     except OSError:
         pass
     return report
+
+
+@dataclass(frozen=True)
+class _Rect:
+    """composite() が必要とする最小限の形（x, y, w, h）。"""
+
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+# 由来ごとの色（BGR）。診断モードで「なぜここに箱があるか」を見えるようにする。
+_DIAGNOSTIC_COLORS = {
+    "detected": (0, 220, 0),
+    "dilate": (0, 200, 200),
+    "interp": (0, 140, 255),
+    "extrap": (0, 0, 255),
+    "manual": (255, 0, 255),
+}
+
+
+def _draw_diagnostic(frame: np.ndarray, mask_rgba: np.ndarray, box: PlacedBox,
+                     x: float, y: float, w: float, h: float) -> None:
+    """実際に隠れる範囲（マスクの不透明画素）を半透明で塗り、由来を書く。
+
+    箱を塗ってはいけない。隠しているのは箱ではなく PNG の不透明画素なので、
+    箱を見せると「覆えている」と誤解する。丸いステッカーの角は透明で、
+    そこは素顔が出る——それが見えることがこのモードの目的。
+    """
+    color = _DIAGNOSTIC_COLORS.get(box.source, (255, 255, 255))
+    # マスクのアルファをそのまま使い、色だけ由来の色に差し替えたものを合成する。
+    tinted = mask_rgba.copy()
+    tinted[:, :, 0] = color[0]
+    tinted[:, :, 1] = color[1]
+    tinted[:, :, 2] = color[2]
+    tinted[:, :, 3] = (tinted[:, :, 3].astype(np.float32) * 0.55).astype(np.uint8)
+    composite(frame, tinted, _Rect(x=x, y=y, w=w, h=h))
+
+    x0, y0 = int(round(x)), int(round(y))
+    x1, y1 = int(round(x + w)), int(round(y + h))
+    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 1)
+    label = box.source[:6] + ("!" if box.uncertain else "")
+    cv2.putText(frame, label, (x0 + 3, max(12, y0 - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)

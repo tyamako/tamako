@@ -90,6 +90,34 @@ def test_roundtrip() -> None:
     assert tl.out_time_to_source(999.0) is None
 
 
+def test_source_to_output_letterbox() -> None:
+    """素材座標 → 出力座標の変換。縦横比が違う素材で余白ぶんずれないこと。
+
+    検出結果は素材ピクセルで持つので、描く直前にここを通す。ここが狂うと
+    マスクが顔から一律にずれ、しかも素材ごとにずれ方が違う。
+    """
+    from tamako.render import source_to_output
+
+    # 同じ縦横比: 等倍・余白なし
+    ratio, dx, dy = source_to_output(1920, 1080, 960, 540)
+    assert abs(ratio - 0.5) < 1e-9 and dx == 0 and dy == 0
+
+    # 縦長素材を横長の枠に入れる → 左右に余白
+    ratio, dx, dy = source_to_output(1080, 1920, 1920, 1080)
+    assert abs(ratio - 1080 / 1920) < 1e-9      # 高さで律速
+    assert abs(dx - (1920 - 1080 * ratio) / 2) < 1e-9
+    assert abs(dy) < 1e-9
+    # 素材の中心は出力の中心に来る
+    cx = (1080 / 2) * ratio + dx
+    assert abs(cx - 960) < 1e-6
+
+    # 横長素材を正方形の枠に入れる → 上下に余白
+    ratio, dx, dy = source_to_output(1920, 1080, 1000, 1000)
+    assert abs(dx) < 1e-9 and dy > 0
+    cy = (1080 / 2) * ratio + dy
+    assert abs(cy - 500) < 1e-6
+
+
 def _write_indexed_video(path: Path, *, frames: int, fps: float, size: int = 64) -> None:
     """フレーム番号を画素に焼き込んだ動画を作る。
 
@@ -184,6 +212,7 @@ def main() -> None:
     test_frame_count()
     test_out_start_accumulates_in_frames()
     test_roundtrip()
+    test_source_to_output_letterbox()
     print("純粋計算の試験: OK")
     test_read_frames_precise_trim()
     test_read_frames_pads_to_expected()
