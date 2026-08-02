@@ -1,7 +1,10 @@
-"""顔検出。OpenCV の YuNet（軽量 DNN 検出器）を使う。
+"""顔検出器（OpenCV の YuNet）とモデルの管理。
 
 顔隠しは「検出漏れ＝顔バレ」なので、精度より取りこぼしの少なさを優先する。
-閾値は低め、箱は大きめ、見失っても直前の位置を保持する、という方針にしてある。
+閾値は低め、箱は大きめ、という方針。
+
+ここが持つのは 1 フレームの検出だけ。動画全体の走査は detect.py、
+検出の途切れを埋める追従は tracks.py が受け持つ。
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
-from .frames import read_frames, scaled_size
 
 MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
 MODEL_URL = (
@@ -164,37 +166,3 @@ class FaceDetector:
                         float(row[-1]), marks)
             )
         return boxes
-
-
-def scan_face_presence(
-    video_path: str | Path,
-    *,
-    source_width: int,
-    source_height: int,
-    source_fps: float,
-    detector: FaceDetector,
-    sample_fps: float = 3.0,
-    detect_width: Optional[int] = 640,
-) -> List[float]:
-    """顔が写っている時刻（標本点）の一覧を返す。カット判定に使う粗い走査。
-
-    毎フレーム見る必要はないので ffmpeg 側で間引く。復号ごと省けるため、
-    長尺でもここは軽い。
-    """
-    out_w, out_h = scaled_size(source_width, source_height, detect_width)
-    filters = [f"fps={sample_fps}"]
-    if (out_w, out_h) != (source_width, source_height):
-        filters.append(f"scale={out_w}:{out_h}")
-
-    _, frames = read_frames(
-        video_path,
-        out_width=out_w,
-        out_height=out_h,
-        fps=sample_fps,
-        filters=filters,
-    )
-    times: List[float] = []
-    for index, frame in enumerate(frames):
-        if detector.detect(frame):
-            times.append(index / sample_fps)
-    return times

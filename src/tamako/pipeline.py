@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from .config import Config
-from .faces import FaceDetector, ensure_model, scan_face_presence
+from .detect import detect_clips, load_detections
 from .ordering import Clip, find_videos, order_clips
 from .segments import CutPlan, build_cut_plan, samples_to_intervals
 from .silence import detect_silence
@@ -39,6 +39,39 @@ def collect_clips(config: Config) -> Tuple[List[Clip], List[Tuple[Path, str]]]:
     return clips, failures
 
 
+def detection_work_dir(config: Config) -> Path:
+    """検出結果の置き場。output/ の外＝人に渡すものと混ざらない場所。"""
+    return config.output_dir / ".tamako_work"
+
+
+def run_detection(
+    clips: Sequence[Clip],
+    config: Config,
+    *,
+    face_model: Optional[str | Path] = None,
+    on_progress: Optional[ProgressFn] = None,
+) -> dict:
+    """全素材の顔検出（重い工程）。済んでいる素材はメタ行の照合で飛ばす。
+
+    保存する閾値はカット用とマスク用の低いほうに合わせる。消費側（カット判定・
+    マスク描画）がそれぞれの閾値でフィルタして使うので、片方の設定を変えても
+    再検出は不要になる。
+    """
+    cut = config.section("cut")
+    mask_cfg = config.section("mask")
+    store_threshold = min(
+        float(cut["face_score_threshold"]), float(mask_cfg["score_threshold"])
+    )
+    return detect_clips(
+        clips,
+        work_dir=detection_work_dir(config),
+        score_threshold=store_threshold,
+        detect_width=int(mask_cfg["detect_width"]),
+        face_model=face_model,
+        on_progress=on_progress,
+    )
+
+
 def analyze_clips(
     clips: Sequence[Clip],
     config: Config,
@@ -46,12 +79,15 @@ def analyze_clips(
     face_model: Optional[str | Path] = None,
     on_progress: Optional[ProgressFn] = None,
 ) -> List[Tuple[Clip, CutPlan]]:
-    """素材ごとに無音と顔在を調べ、残す区間を決める。"""
+    """素材ごとに無音と顔在を調べ、残す区間を決める。
+
+    顔在は faces.jsonl（全フレーム検出）から導く。以前ここにあった 3fps の
+    別走査は廃止した。検出は 1 回で、カット判定とマスク描画の両方が使う。
+    """
     cut = config.section("cut")
-    detector = FaceDetector(
-        ensure_model(face_model), score_threshold=float(cut["face_score_threshold"])
+    detections = run_detection(
+        clips, config, face_model=face_model, on_progress=on_progress
     )
-    sample_fps = float(cut["face_analysis_fps"])
 
     results: List[Tuple[Clip, CutPlan]] = []
     for clip in clips:
@@ -65,17 +101,15 @@ def analyze_clips(
             noise_db=float(cut["silence_db"]),
             min_silence_sec=float(cut["silence_min_sec"]),
         )
-        times = scan_face_presence(
-            clip.path,
-            source_width=clip.info.width,
-            source_height=clip.info.height,
-            source_fps=clip.info.fps,
-            detector=detector,
-            sample_fps=sample_fps,
-            detect_width=int(cut["detect_width"]) or None,
+        det = load_detections(detections[clip.path])
+        threshold = float(cut["face_score_threshold"])
+        times = sorted(
+            rec.pts
+            for rec in det.records.values()
+            if any(box[4] >= threshold for box in rec.boxes)
         )
         face_present = samples_to_intervals(
-            times, step=1.0 / sample_fps, hold=float(cut["face_hold_sec"])
+            times, step=1.0 / det.fps, hold=float(cut["face_hold_sec"])
         )
         plan = build_cut_plan(
             duration=clip.info.duration,

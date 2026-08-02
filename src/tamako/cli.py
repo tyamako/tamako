@@ -151,6 +151,28 @@ def _load(args: argparse.Namespace) -> Config:
     return config
 
 
+def cmd_detect(args: argparse.Namespace) -> int:
+    """顔検出だけを先に走らせる（重い工程。結果はキャッシュされる）。"""
+    import time
+
+    from .pipeline import collect_clips, detection_work_dir, run_detection
+
+    config = _load(args)
+    clips, failures = collect_clips(config)
+    for path, reason in failures:
+        _print(f"  読み飛ばし: {path.name} ({reason})")
+
+    started = time.monotonic()
+    run_detection(clips, config, face_model=args.face_model, on_progress=_status)
+    _clear_status()
+    took = time.monotonic() - started
+    total = sum(c.info.duration for c in clips)
+    _print(f"検出が完了しました: {len(clips)} 本 / 素材 {total:.1f}s / 所要 {took:.1f}s")
+    _print(f"  結果の置き場: {detection_work_dir(config) / 'detect'}")
+    _print("  ※ 素材や検出設定が変わらない限り、次回からここは飛ばされます。")
+    return 0
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """書き出さずに、並び順とカット結果だけを見る。"""
     from .pipeline import analyze_clips, collect_clips, describe_plans
@@ -408,6 +430,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("directory", nargs="?", default=".", help="作る場所（既定: 今のフォルダ）")
     p_init.add_argument("--force", action="store_true", help="既存の config.json を上書きする")
     p_init.set_defaults(func=cmd_init)
+
+    p_detect = subparsers.add_parser("detect", parents=[common, folders],
+                                     help="顔検出だけを先に走らせる（結果はキャッシュされる）")
+    p_detect.set_defaults(func=cmd_detect)
 
     p_check = subparsers.add_parser("check", parents=[common, folders],
                                     help="書き出さずに並び順とカット結果を見る")
