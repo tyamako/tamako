@@ -20,7 +20,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .segments import Interval, intersect, invert, merge
-from .tracks import SOURCE_DETECTED, SOURCE_RISK, TrackedClip
+from .tracks import SOURCE_DETECTED, SOURCE_MANUAL, SOURCE_RISK, TrackedClip
+
+# 「推定ではない」箱。人が置いた箱は推定ではなく決定なので、検出と同格に扱う。
+AUTHORITATIVE = {SOURCE_DETECTED, SOURCE_MANUAL}
 
 # サイトの種類
 KIND_NO_MASK = "no_mask"        # 何も描いていない
@@ -82,12 +85,20 @@ def build_sites(
     *,
     duration: float,
     min_site_sec: float = 0.05,
+    skip: Sequence[Interval] = (),
 ) -> List[Site]:
     """1 素材ぶんのサイトを作る。残す区間の中だけを見る。
 
     捨てる区間の顔漏れは出力に出ないので、人に見せると本物の危険が埋もれる。
+    skip には、まだ有効な「確認済み」の区間を渡す。前回見て問題なかった箇所を
+    毎回出し直すのが、確認作業が破綻する最大の原因。
     """
     fps = tracked.fps
+    skipped = merge(list(skip)) if skip else []
+
+    def is_skipped(f: int) -> bool:
+        t0 = f / fps
+        return any(s <= t0 < e for s, e in skipped)
     voiced = invert(list(silent), duration) if silent else [(0.0, duration)]
 
     def is_voiced(t: float) -> bool:
@@ -99,13 +110,15 @@ def build_sites(
         first = int(round(start * fps))
         last = int(round(end * fps))
         for f in range(first, last):
+            if is_skipped(f):
+                continue
             boxes = tracked.at_frame(f)
             if not boxes:
                 flags[f] = KIND_NO_MASK
             elif any(b.uncertain for b in boxes):
                 flags[f] = KIND_UNCERTAIN
                 tracks_at[f] = [b.track_id for b in boxes]
-            elif all(b.source != SOURCE_DETECTED for b in boxes):
+            elif all(b.source not in AUTHORITATIVE for b in boxes):
                 flags[f] = KIND_ESTIMATED
                 tracks_at[f] = [b.track_id for b in boxes]
 

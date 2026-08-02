@@ -170,13 +170,70 @@ def analyze_clips(
     return results
 
 
+def merge_manual(clips: Sequence[Clip], tracked: dict, config: Config) -> Tuple[dict, object]:
+    """自動の結果に人手修正を重ねる。人手が常に勝つ。
+
+    negative_regions（ポスター・鏡など恒常的な誤検出）もここで落とす。
+    毎回同じ場所で「消す」を繰り返させないため。
+    """
+    from .manual import ManualEdits, apply_manual, load_negative_regions
+
+    work = detection_work_dir(config)
+    edits = ManualEdits(work / "faces_manual.jsonl")
+    regions = load_negative_regions(config.output_dir.parent / "negative_regions.json")
+    merged = {}
+    for clip in clips:
+        track = tracked.get(clip.path)
+        if track is None:
+            continue
+        merged[clip.path] = apply_manual(
+            track, edits.effective(clip=clip.path.name), negative_regions=regions
+        )
+    return merged, edits
+
+
+def confirmed_spans(clip: Clip, tracked_clip, edits, config: Config) -> List[Tuple[float, float]]:
+    """まだ有効な「確認済み」区間。
+
+    「下の検出結果が変わったら再確認」を箱の一致で判定すると、閾値を 0.01
+    動かしただけで全部の確認が飛ぶ。しかも人が設定を変える動機の大半は
+    安全側（scale を上げる・閾値を下げる）なので、最も安全な操作が最も確認を
+    壊すことになる。**被覆が減っていなければ維持する**（上位集合なら、
+    新たな漏れは原理的に発生しない）。
+    """
+    from .manual import OP_CONFIRM, confirmation_still_valid, coverage_signature
+    from .overlay import effective_scale, load_mask
+
+    ops = [op for op in edits.effective(clip=clip.path.name) if op.op == OP_CONFIRM]
+    if not ops:
+        return []
+
+    mask_cfg = config.section("mask")
+    mask = load_mask(config.mask_image)
+    scale = effective_scale(float(mask_cfg["scale"]), mask)
+    offset_y = float(mask_cfg.get("offset_y", 0.0))
+
+    spans: List[Tuple[float, float]] = []
+    for op in ops:
+        old = op.data.get("signature", "")
+        now = coverage_signature(
+            tracked_clip, op.start, op.end, mask[:, :, 3],
+            mask_scale=scale, offset_y=offset_y,
+        )
+        if confirmation_still_valid(old, now):
+            spans.append((op.start, op.end))
+    return spans
+
+
 def collect_sites(
     clip_plans: Sequence[Tuple[Clip, CutPlan]],
     tracked: dict,
     *,
     min_site_sec: float = 0.05,
+    edits: object = None,
+    config: Optional[Config] = None,
 ) -> list:
-    """全素材のサイトを危険度順に集める。"""
+    """全素材のサイトを危険度順に集める。確認済みの区間は出さない。"""
     from .sites import build_sites
 
     sites = []
@@ -184,9 +241,12 @@ def collect_sites(
         track = tracked.get(clip.path)
         if track is None:
             continue
+        skip: List[Tuple[float, float]] = []
+        if edits is not None and config is not None:
+            skip = confirmed_spans(clip, track, edits, config)
         sites.extend(build_sites(
             clip.path, track, plan.keep, plan.silent,
-            duration=clip.info.duration, min_site_sec=min_site_sec,
+            duration=clip.info.duration, min_site_sec=min_site_sec, skip=skip,
         ))
     sites.sort(key=lambda s: s.risk, reverse=True)
     return sites
@@ -196,6 +256,7 @@ def apply_uncovered_policy(
     clip_plans: Sequence[Tuple[Clip, CutPlan]],
     tracked: dict,
     config: Config,
+    edits: object = None,
 ) -> Tuple[List[Tuple[Clip, CutPlan]], list, float]:
     """C-2。覆えない区間の扱いを適用し、(計画, サイト, 削った秒数) を返す。
 
@@ -203,26 +264,41 @@ def apply_uncovered_policy(
     フレームを個別に落とすと映像の枚数と音声の秒数が食い違い、
     時間軸の契約が壊れて全体が音ズレする。
     """
+    from .manual import manual_cut_intervals
+    from .segments import intersect, invert, total
     from .sites import apply_cut_policy
-    from .segments import invert, total
 
     policy = str(config.section("mask").get("uncovered_policy", "expand"))
-    sites = collect_sites(clip_plans, tracked)
-    if policy != "cut":
+    sites = collect_sites(clip_plans, tracked, edits=edits, config=config)
+
+    # 人が「ここは落とす」と決めた区間は、policy によらず必ず落とす。
+    manual_cuts: dict = {}
+    if edits is not None:
+        for clip, _ in clip_plans:
+            spans = manual_cut_intervals(edits.effective(clip=clip.path.name))
+            if spans:
+                manual_cuts[clip.path] = spans
+
+    if policy != "cut" and not manual_cuts:
         return list(clip_plans), sites, 0.0
 
     min_keep = float(config.section("cut")["min_keep_sec"])
     adjusted: List[Tuple[Clip, CutPlan]] = []
     removed = 0.0
     for clip, plan in clip_plans:
-        mine = [s for s in sites if s.clip == clip.path]
-        keep = apply_cut_policy(plan.keep, mine, min_keep_sec=min_keep)
+        keep = list(plan.keep)
+        if policy == "cut":
+            mine = [s for s in sites if s.clip == clip.path]
+            keep = apply_cut_policy(keep, mine, min_keep_sec=min_keep)
+        for span in manual_cuts.get(clip.path, []):
+            keep = intersect(keep, invert([span], clip.info.duration))
+        keep = [(s, e) for s, e in keep if e - s >= min_keep]
         removed += total(plan.keep) - total(keep)
         adjusted.append((clip, replace(
             plan, keep=keep, cut=invert(keep, clip.info.duration)
         )))
     # 削った後の状態でサイトを取り直す（削れた箇所はもう出力に出ない）。
-    return adjusted, collect_sites(adjusted, tracked), removed
+    return adjusted, collect_sites(adjusted, tracked, edits=edits, config=config), removed
 
 
 def describe_plans(clip_plans: Sequence[Tuple[Clip, CutPlan]]) -> str:

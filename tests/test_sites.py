@@ -83,6 +83,27 @@ def test_kind_priority() -> None:
     assert all(not (s.start <= 0.35 < s.end) for s in sites)
 
 
+def test_manual_boxes_are_not_estimates() -> None:
+    """人が置いた箱は推定ではなく決定。サイトとして出し直さない。"""
+    from tamako.tracks import SOURCE_MANUAL
+
+    boxes = {f: [_box(SOURCE_MANUAL)] for f in range(20)}
+    sites = build_sites(CLIP, _tracked(boxes), [(0.0, 2.0)], [], duration=2.0)
+    assert not sites, f"人手の箱が要確認として出ている: {sites}"
+
+
+def test_confirmed_ranges_are_skipped() -> None:
+    """確認済みの区間は出し直さない。毎回同じ箇所を見せるのが破綻の原因。"""
+    boxes = {f: [] for f in range(30)}
+    all_sites = build_sites(CLIP, _tracked(boxes), [(0.0, 3.0)], [], duration=3.0)
+    assert all_sites
+
+    partial = build_sites(CLIP, _tracked(boxes), [(0.0, 3.0)], [],
+                          duration=3.0, skip=[(0.0, 2.0)])
+    for site in partial:
+        assert site.start >= 2.0 - 1e-6, f"確認済みの区間が出ている: {site}"
+
+
 def test_cut_policy_removes_uncovered() -> None:
     """uncovered_policy=cut が、覆えない区間を残す区間から削る。"""
     boxes = {f: [_box()] for f in range(50)}

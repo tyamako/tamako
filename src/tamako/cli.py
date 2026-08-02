@@ -70,23 +70,27 @@ CONFIG_TEMPLATE = """{
 
     "silence_db": -32.0,        // これより静かなら無音とみなす（-40 で厳しく、-25 で緩く）
     "silence_min_sec": 0.8,     // この長さ以上続いた無音だけを対象にする
-    "face_analysis_fps": 3.0,   // 顔の有無を調べる細かさ（大きいほど正確・遅い）
-    "face_score_threshold": 0.6,// 顔と判定する確信度
+    "face_analysis_fps": 3.0,   // （互換のため残しています。今は使いません）
+    "face_score_threshold": 0.6,// 顔と判定する確信度（カット判定用）
     "face_hold_sec": 1.0,       // この長さ以下の検出の途切れは無視する
     "padding_sec": 0.25,        // 残す区間の前後に足す余白（語頭語尾の切れ防止）
     "min_keep_sec": 0.6,        // これより短い残り区間は捨てる
-    "min_cut_sec": 0.5          // これより短いカットは行わない（細切れ防止）
+    "min_cut_sec": 0.5,         // これより短いカットは行わない（細切れ防止）
+    "detect_width": 640         // カット判定用の検出解像度（マスク用とは独立）
   },
 
   // ── 顔の隠し方 ───────────────────────────────────────
   "mask": {
     "score_threshold": 0.5,   // 隠すときは低めにする（見逃すより多めに隠す）
     "scale": 2.0,             // 検出枠の何倍を隠すか。1.6 だと髪が出ます
+                              // ※ mask.png の透明部分に応じて自動で補正されます
     "offset_y": 0.0,          // 上下の微調整（顔の高さに対する割合、負で上）
-    "hold_sec": 0.7,          // 見失っても直前の位置に出し続ける長さ
-    "detect_width": 640,      // 検出用に縮小する幅（小さいほど速い）
-    "detect_every_n_frames": 1, // 1 なら毎フレーム検出（最も安全）
-    "low_score_warn": 0.75    // これ未満の確信度は報告書に記録する
+    "hold_sec": 0.7,          // 検出が切れたあと、外挿で覆い続ける長さ
+    "detect_width": 640,      // 検出用に縮小する幅（大きいほど小さい顔に強い・遅い）
+    "dilate_frames": 2,       // 前後これだけのフレームの箱も取り込む（保険）
+    "expand_per_velocity": 0.5, // 推定の不確かさを箱の大きさで吸収する強さ
+    "expand_limit": 4.0,      // 広げる上限（倍）。超えたら「位置不明」として報告
+    "uncovered_policy": "expand" // 覆えない箇所: expand / cut / warn
   },
 
   // ── 書き出し設定 ─────────────────────────────────────
@@ -211,7 +215,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     from .ordering import describe_order
     from .pipeline import (
         analyze_clips, apply_uncovered_policy, collect_clips, describe_plans,
-        detection_work_dir, run_detection, track_clips,
+        detection_work_dir, merge_manual, run_detection, track_clips,
     )
     from .render import render
     from .report import summarize, write_cut_list_csv, write_json_report
@@ -245,11 +249,17 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     detections = run_detection(clips, config, face_model=args.face_model)
     tracked = track_clips(clips, config, detections, on_progress=_status)
+    tracked, edits = merge_manual(clips, tracked, config)
     _clear_status()
 
-    plans, sites, removed = apply_uncovered_policy(plans, tracked, config)
+    manual_count = len(edits.effective())
+    if manual_count:
+        _print(f"  人手修正を {manual_count} 件反映しました")
+
+    plans, sites, removed = apply_uncovered_policy(plans, tracked, config, edits)
     if removed > 0:
-        _print(f"  覆えない区間を {removed:.2f}s 削りました（uncovered_policy: cut）")
+        _print(f"  覆えない区間を {removed:.2f}s 削りました")
+    if manual_count or removed > 0:
         _print("")
 
     report = render(
@@ -297,6 +307,61 @@ def cmd_edit(args: argparse.Namespace) -> int:
         _print("次の工程: 動画を見ながら声を録音し、その音声ファイルを用意してから")
         _print(f"  tamako finish --video \"{report.output}\" --audio \"収録音声.wav\"")
     return 0
+
+
+def cmd_fix(args: argparse.Namespace) -> int:
+    """要確認の箇所を順に開いて直す（人が仕上げる工程）。"""
+    from .fix import FixError, ReviewSession, run_window
+    from .manual import ManualEdits
+    from .pipeline import (
+        analyze_clips, collect_clips, collect_sites, merge_manual,
+        run_detection, track_clips,
+    )
+    from .sites import describe_sites, summarize_sites
+
+    config = _load(args)
+    mask_path = config.mask_image
+    if not mask_path.is_file():
+        _print(f"顔に重ねる画像が見つかりません: {mask_path}")
+        return 1
+
+    clips, _ = collect_clips(config)
+    plans = analyze_clips(clips, config, face_model=args.face_model, on_progress=_status)
+    detections = run_detection(clips, config, face_model=args.face_model)
+    tracked = track_clips(clips, config, detections, on_progress=_status)
+    tracked, edits = merge_manual(clips, tracked, config)
+    _clear_status()
+
+    sites = collect_sites(plans, tracked, edits=edits, config=config)
+
+    _print(summarize_sites(sites, out_duration=sum(p.kept_seconds for _, p in plans)))
+    _print("")
+    _print("── 危険度の高い順 ────────────────────")
+    _print(describe_sites(sites, limit=30))
+    _print("")
+    _print(f"  これまでの修正: {len(edits.effective())} 件  ({edits.path})")
+
+    if args.list_only:
+        return 0
+    if not sites:
+        _print("直すところはありません。")
+        return 0
+
+    mask_cfg = config.section("mask")
+    session = ReviewSession(
+        clips=list(clips), tracked=tracked, sites=sites, edits=edits,
+        mask_path=mask_path,
+        mask_scale=float(mask_cfg["scale"]),
+        mask_offset_y=float(mask_cfg.get("offset_y", 0.0)),
+    )
+    try:
+        return run_window(session)
+    except FixError as exc:
+        _print("")
+        _print(str(exc))
+        _print("")
+        _print("窓が使えない場合でも、--list で確認箇所の一覧は出せます。")
+        return 1
 
 
 def cmd_transcribe(args: argparse.Namespace) -> int:
@@ -463,6 +528,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_edit.add_argument("--diagnostic", action="store_true",
                         help="マスクの代わりに覆う範囲と由来を描く（位置合わせの確認用）")
     p_edit.set_defaults(func=cmd_edit)
+
+    p_fix = subparsers.add_parser("fix", parents=[common, folders],
+                                  help="要確認の箇所を順に開いて直す")
+    p_fix.add_argument("--review", action="store_true",
+                       help="危険度順に開く（既定の動作）")
+    p_fix.add_argument("--list", dest="list_only", action="store_true",
+                       help="一覧を出すだけで窓は開かない")
+    p_fix.set_defaults(func=cmd_fix)
 
     p_tr = subparsers.add_parser("transcribe", parents=[common],
                                  help="収録音声から字幕ファイルだけを作る")
