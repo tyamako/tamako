@@ -61,12 +61,23 @@ class PlacedBox:
     def center(self) -> Tuple[float, float]:
         return self.x + self.w / 2, self.y + self.h / 2
 
-    def grown(self, factor: float) -> "PlacedBox":
-        if factor <= 1.0:
-            return self
+    def resized(self, factor: float) -> "PlacedBox":
+        """中心を保ったまま倍率で大きさを変える。**縮小もできる。**
+
+        faces.py の FaceBox.scaled とは意味が逆（あちらは座標ごと倍率で掛ける
+        「縮小して検出した結果を元の解像度に戻す」変換）。名前を分けてある。
+        """
         cx, cy = self.center
         nw, nh = self.w * factor, self.h * factor
         return replace(self, x=cx - nw / 2, y=cy - nh / 2, w=nw, h=nh)
+
+    def grown(self, factor: float) -> "PlacedBox":
+        """拡大だけ。補間・外挿の「不確かさを箱で吸収する」用。
+
+        縮小したいときは resized を直接呼ぶ。ここが黙って self を返すせいで
+        人手の縮小が無言で無視されていた。
+        """
+        return self if factor <= 1.0 else self.resized(factor)
 
     def contains(self, other: "PlacedBox", tol: float = 1.0) -> bool:
         return (

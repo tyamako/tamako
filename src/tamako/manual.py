@@ -36,6 +36,9 @@ OP_UNDO = "undo"        # 直前の操作を打ち消す
 # アンカーからこの倍率までを「同じ対象」とみなす（箱の長辺に対して）。
 ANCHOR_RADIUS_RATIO = 1.5
 
+# hold が「元にする箱」を探して遡る上限（秒）。
+HOLD_SCAN_SEC = 2.0
+
 
 @dataclass
 class Operation:
@@ -212,17 +215,23 @@ def apply_manual(
                 updated = []
                 for b in boxes.get(f, []):
                     if anchor is None or _near(b, anchor):
+                        # uncertain は落とさない。人が位置を触ったことは、
+                        # 推定の不確かさが消えたことを意味しない。落とすと
+                        # 1 フレームのナッジで区間全体が要確認から消える。
                         moved = replace(b, x=b.x + dx, y=b.y + dy,
-                                        source=SOURCE_MANUAL, uncertain=False)
-                        updated.append(moved.grown(factor) if factor > 1.0 else moved)
+                                        source=SOURCE_MANUAL)
+                        updated.append(moved.resized(factor) if factor != 1.0 else moved)
                     else:
                         updated.append(b)
                 boxes[f] = updated
         elif op.op == OP_HOLD:
             anchor = op.data.get("anchor")
             start_f = int(round(op.start * fps))
+            # 遡る距離に上限を切る。顔が一度も検出されていない場所で押すと
+            # クリップ先頭まで線形に遡り、しかも refresh のたびに再実行される。
+            floor_f = max(-1, start_f - int(round(HOLD_SCAN_SEC * fps)))
             source: Optional[PlacedBox] = None
-            for f in range(start_f, -1, -1):
+            for f in range(start_f, floor_f, -1):
                 candidates = [b for b in boxes.get(f, []) if anchor is None or _near(b, anchor)]
                 if candidates:
                     source = candidates[0]
@@ -253,17 +262,23 @@ SIGNATURE_W, SIGNATURE_H = 32, 18
 
 def coverage_signature(
     tracked: TrackedClip, start: float, end: float, mask_alpha: np.ndarray,
-    *, mask_scale: float = 1.0, offset_y: float = 0.0, step: int = 3,
+    *, mask_scale: float = 1.0, offset_y: float = 0.0, step: int = 1,
 ) -> str:
     """区間で実際に覆ったアルファの和集合を、32x18 のビット列にして返す。
 
     箱ではなくアルファで取るのが要点。隠しているのは箱ではないので、箱で
     比べると「丸いステッカーの角から顔が出ている」変化を見逃す。
+
+    範囲は build_sites と同じ半開区間 [start, end)、step は 1。以前は終端が
+    1 フレーム長く、しかも 3 フレームに 2 枚を署名から落としていたので、
+    落ちたフレームで被覆が減っても確認済みが維持されてしまっていた。
     """
     fps = tracked.fps
     grid = np.zeros((SIGNATURE_H, SIGNATURE_W), dtype=bool)
     alpha = mask_alpha >= 128
-    for f in range(int(round(start * fps)), int(round(end * fps)) + 1, max(1, step)):
+    first = int(round(start * fps))
+    last = max(int(round(end * fps)), first + 1)  # 1 フレーム未満でも 1 枚は見る
+    for f in range(first, last, max(1, step)):
         for box in tracked.at_frame(f):
             cx, cy = box.center
             cy += box.h * offset_y

@@ -25,8 +25,10 @@ def _tracked(boxes_by_frame=None) -> TrackedClip:
                        boxes=dict(boxes_by_frame or {}))
 
 
-def _box(x=100, y=100, w=40, h=40, source=SOURCE_DETECTED) -> PlacedBox:
-    return PlacedBox(x=x, y=y, w=w, h=h, source=source, track_id="t1", score=0.9)
+def _box(x=100, y=100, w=40, h=40, source=SOURCE_DETECTED,
+         uncertain=False) -> PlacedBox:
+    return PlacedBox(x=x, y=y, w=w, h=h, source=source, track_id="t1",
+                     score=0.9, uncertain=uncertain)
 
 
 def test_add_is_union_with_auto() -> None:
@@ -81,6 +83,78 @@ def test_adjust_scales_and_nudges() -> None:
     box = merged.at_frame(0)[0]
     assert abs(box.w - 80) < 1e-6 and abs(box.h - 80) < 1e-6
     assert abs(box.center[0] - 130) < 1e-6 and abs(box.center[1] - 115) < 1e-6
+
+
+def test_adjust_can_shrink() -> None:
+    """scale < 1.0 で箱が小さくなる（中心は保つ）。
+
+    grown() が factor <= 1.0 で self を返すため、以前は無言で無視されていた。
+    「大きすぎるから縮める」が効かないと、人は delete に逃げる。
+    """
+    tracked = _tracked({0: [_box(100, 100, 40, 40)]})
+    op = Operation(op=OP_ADJUST, clip="a.mp4", start=0.0, end=0.1,
+                   data={"anchor": [120, 120], "scale": 0.5})
+    merged = apply_manual(tracked, [op])
+    box = merged.at_frame(0)[0]
+    assert abs(box.w - 20) < 1e-6 and abs(box.h - 20) < 1e-6, f"縮んでいない: {box}"
+    assert abs(box.center[0] - 120) < 1e-6 and abs(box.center[1] - 120) < 1e-6
+
+
+def test_adjust_keeps_uncertain() -> None:
+    """位置を人が触っても、推定の不確かさの印は消えない。
+
+    消すと 3 秒の uncertain 区間を 1 フレームだけナッジしただけで
+    サイトが 0 件になる（confirm を押していないのに一覧から消える）。
+    """
+    tracked = _tracked({f: [_box(uncertain=True)] for f in range(10)})
+    op = Operation(op=OP_ADJUST, clip="a.mp4", start=0.0, end=0.1,
+                   data={"anchor": [120, 120], "dx": 6})
+    merged = apply_manual(tracked, [op])
+    box = merged.at_frame(0)[0]
+    assert abs(box.x - 106) < 1e-6, f"動いていない: {box}"
+    assert box.uncertain, "uncertain が落ちている"
+
+
+def test_adjust_from_rect_roundtrip() -> None:
+    """UI が引いた矩形 → dx/dy/scale → 結果 が一致する。
+
+    (100,100,40,40) を掴んで (150,120,60,60) に置き直す操作。
+    """
+    tracked = _tracked({0: [_box(100, 100, 40, 40)]})
+    old_cx, old_cy, old_w = 120.0, 120.0, 40.0
+    new = (150.0, 120.0, 60.0, 60.0)
+    new_cx, new_cy = new[0] + new[2] / 2, new[1] + new[3] / 2
+    op = Operation(op=OP_ADJUST, clip="a.mp4", start=0.0, end=0.1, data={
+        "anchor": [old_cx, old_cy],
+        "dx": new_cx - old_cx, "dy": new_cy - old_cy,
+        "scale": new[2] / old_w,
+    })
+    box = apply_manual(tracked, [op]).at_frame(0)[0]
+    assert all(abs(a - b) < 1e-6 for a, b in
+               zip((box.x, box.y, box.w, box.h), new)), f"{box} != {new}"
+
+
+def test_hold_scan_is_bounded() -> None:
+    """元にする箱を探して遡る距離に上限がある。
+
+    上限が無いと、顔が一度も検出されていない場所で押したときクリップ先頭まで
+    18000 回転し、しかも refresh のたびに再実行される。
+    """
+    from tamako.manual import HOLD_SCAN_SEC
+
+    far = int(HOLD_SCAN_SEC * FPS) + 5
+    tracked = _tracked({0: [_box()], **{f: [] for f in range(1, far + 10)}})
+    op = Operation(op=OP_HOLD, clip="a.mp4", start=far / FPS,
+                   end=(far + 3) / FPS, data={})
+    merged = apply_manual(tracked, [op])
+    assert not merged.at_frame(far), "上限を超えて遡っている"
+
+    # 上限の内側なら今までどおり効く。
+    near = int(HOLD_SCAN_SEC * FPS) - 2
+    tracked2 = _tracked({0: [_box()], **{f: [] for f in range(1, near + 10)}})
+    op2 = Operation(op=OP_HOLD, clip="a.mp4", start=near / FPS,
+                    end=(near + 3) / FPS, data={})
+    assert apply_manual(tracked2, [op2]).at_frame(near), "上限の内側で効いていない"
 
 
 def test_hold_extends_last_box() -> None:

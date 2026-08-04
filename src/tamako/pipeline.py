@@ -170,17 +170,32 @@ def analyze_clips(
     return results
 
 
+def negative_regions_for(config: Config) -> list:
+    """恒常的な誤検出領域（ポスター・鏡・人形）。
+
+    UI 側の refresh も同じものを見なければならない。ここで括り出しておかないと、
+    UI 上だけ誤検出が「復活して見え」、利用者が無駄な delete を積む。
+    """
+    from .manual import load_negative_regions
+
+    return load_negative_regions(config.output_dir.parent / "negative_regions.json")
+
+
 def merge_manual(clips: Sequence[Clip], tracked: dict, config: Config) -> Tuple[dict, object]:
     """自動の結果に人手修正を重ねる。人手が常に勝つ。
 
     negative_regions（ポスター・鏡など恒常的な誤検出）もここで落とす。
     毎回同じ場所で「消す」を繰り返させないため。
+
+    **返すのは新しい辞書で、引数の tracked は書き換えない。** 呼び出し側が
+    「まだ人手を当てていない生の結果」を持ち続けられることが、二重適用を
+    構造的に防ぐ唯一の手段になる。
     """
-    from .manual import ManualEdits, apply_manual, load_negative_regions
+    from .manual import ManualEdits, apply_manual
 
     work = detection_work_dir(config)
     edits = ManualEdits(work / "faces_manual.jsonl")
-    regions = load_negative_regions(config.output_dir.parent / "negative_regions.json")
+    regions = negative_regions_for(config)
     merged = {}
     for clip in clips:
         track = tracked.get(clip.path)

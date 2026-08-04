@@ -17,10 +17,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .ffmpeg import FFmpegError
 from .frames import read_frames
 from .manual import (
     OP_ADD, OP_ADJUST, OP_CONFIRM, OP_CUT, OP_DELETE, OP_HOLD,
@@ -44,55 +45,101 @@ class _Rect:
     h: float
 
 
+def read_block(clip: Clip, start_frame: int, count: int) -> List[np.ndarray]:
+    """素材から連続する count 枚を読む。**フレーム番号で受ける。**
+
+    ジェネレータは必ず閉じる。途中でやめたジェネレータは GC まで finally が
+    走らず、ffmpeg プロセスが溜まる（Windows で目立つ）。
+    """
+    fps = clip.info.fps
+    _, frames = read_frames(
+        clip.path,
+        out_width=clip.info.width, out_height=clip.info.height,
+        fps=fps, filters=[f"fps={fps}"],
+        start=start_frame / fps, duration=count / fps, expected_frames=count,
+    )
+    try:
+        return [frame.copy() for frame in frames]
+    finally:
+        frames.close()
+
+
 class FrameCache:
     """素材の 1 フレームを取り出す。近傍をまとめて読んで持っておく。
 
     人はサイトの前後を行き来するので、1 フレームずつ ffmpeg を起動すると
     待ち時間がそのまま作業時間になる。
+
+    **番地はフレーム番号。** 箱がフレーム番号キーなので、pts を持ち回ると
+    丸めが二重にかかる。範囲外は例外ではなく None を返す——クリップ終端は
+    人が普通にスクラブして踏む場所であり、そこで工程ごと落ちるのは論外。
     """
 
-    def __init__(self, clips: Sequence[Clip], *, window_sec: float = 2.0) -> None:
+    def __init__(self, clips: Sequence[Clip], *, window_sec: float = 2.0,
+                 frames_total: Optional[Dict[Path, int]] = None,
+                 reader: Optional[Callable[[Clip, int, int], List[np.ndarray]]] = None) -> None:
         self._clips = {c.path: c for c in clips}
         self._window = window_sec
+        self._total = dict(frames_total or {})
+        self._reader = reader or read_block
         self._cache: Dict[Tuple[Path, int], np.ndarray] = {}
-        self._loaded: List[Tuple[Path, float, float]] = []
+        # 読み込み済みの窓。フレーム番号の半開区間 [lo, hi)。
+        self._loaded: List[Tuple[Path, int, int]] = []
 
-    def get(self, clip_path: Path, pts: float) -> Optional[np.ndarray]:
+    def frames_total(self, clip_path: Path) -> int:
+        """このクリップに存在するフレーム数。無い番号は読みに行かない。"""
+        clip = self._clips.get(clip_path)
+        if clip is None:
+            return 0
+        return self._total.get(clip_path) or clip.info.frame_count_estimate
+
+    def get(self, clip_path: Path, frame: int) -> Optional[np.ndarray]:
         clip = self._clips.get(clip_path)
         if clip is None:
             return None
-        index = int(round(pts * clip.info.fps))
-        key = (clip_path, index)
+        if not (0 <= frame < self.frames_total(clip_path)):
+            return None
+        key = (clip_path, frame)
         if key not in self._cache:
-            self._load_around(clip, pts)
+            self._load_around(clip, frame)
         return self._cache.get(key)
 
-    def _load_around(self, clip: Clip, pts: float) -> None:
-        start = max(0.0, pts - self._window / 2)
-        duration = min(self._window, max(0.1, clip.info.duration - start))
-        count = max(1, int(round(duration * clip.info.fps)))
-        _, frames = read_frames(
-            clip.path,
-            out_width=clip.info.width, out_height=clip.info.height,
-            fps=clip.info.fps, filters=[f"fps={clip.info.fps}"],
-            start=start, duration=duration, expected_frames=count,
-        )
-        base = int(round(start * clip.info.fps))
-        for offset, frame in enumerate(frames):
-            self._cache[(clip.path, base + offset)] = frame.copy()
+    def _load_around(self, clip: Clip, frame: int) -> None:
+        total = self.frames_total(clip.path)
+        span = max(1, int(round(self._window * clip.info.fps)))
+        lo = max(0, frame - span // 2)
+        # 終端でクランプする。expected_frames は最終フレームを複製して枚数を
+        # 合わせるので、存在しない番号まで要求すると「静止した最後の絵」が生える。
+        hi = min(total, lo + span)
+        if hi <= lo:
+            return
+        try:
+            frames = self._reader(clip, lo, hi - lo)
+        except FFmpegError:
+            return  # 読めなかった。呼び出し側は None を受けて 404 を返す
+        for offset, image in enumerate(frames[: hi - lo]):
+            self._cache[(clip.path, lo + offset)] = image
+
         # 古い窓は捨てる。長尺で全部持つとメモリが尽きる。
-        self._loaded.append((clip.path, start, start + duration))
+        # ただし**新しい窓が読み直した番号は残す**（重なりを消していた）。
+        self._loaded.append((clip.path, lo, hi))
         if len(self._loaded) > 4:
-            old_path, old_start, old_end = self._loaded.pop(0)
-            lo = int(round(old_start * self._clips[old_path].info.fps))
-            hi = int(round(old_end * self._clips[old_path].info.fps))
-            for i in range(lo, hi + 1):
-                self._cache.pop((old_path, i), None)
+            old_path, old_lo, old_hi = self._loaded.pop(0)
+            live = [(l, h) for p, l, h in self._loaded if p == old_path]
+            for i in range(old_lo, old_hi):
+                if not any(l <= i < h for l, h in live):
+                    self._cache.pop((old_path, i), None)
 
 
 @dataclass
 class ReviewSession:
-    """確認と修正の状態。窓が無くても動く（試験もここを叩く）。"""
+    """確認と修正の状態。窓が無くても動く（試験もここを叩く）。
+
+    **tracked には `track_clips` の生の出力を渡す。** 人手修正を当てるのは
+    refresh() だけの仕事にする。人手済みの結果を渡すと __post_init__ が
+    もう一度当て、scale=1.15 が 1.15²=1.323 倍になる（しかも confirm が
+    二重適用の絵から署名を取るので、次回起動で確認済みが即失効する）。
+    """
 
     clips: List[Clip]
     tracked: Dict[Path, TrackedClip]
@@ -101,6 +148,7 @@ class ReviewSession:
     mask_path: Path
     mask_scale: float = 2.0
     mask_offset_y: float = 0.0
+    negative_regions: Sequence[Dict] = ()
     index: int = 0
     frame_offset: int = 0
     _cache: Optional[FrameCache] = None
@@ -109,7 +157,10 @@ class ReviewSession:
     _merged: Dict[Path, TrackedClip] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self._cache = FrameCache(self.clips)
+        self._cache = FrameCache(
+            self.clips,
+            frames_total={p: t.frames_total for p, t in self.tracked.items()},
+        )
         self._mask = load_mask(self.mask_path)
         self._scale_eff = effective_scale(self.mask_scale, self._mask)
         self.refresh()
@@ -117,11 +168,17 @@ class ReviewSession:
     # ---------------------------------------------------------- 状態
 
     def refresh(self) -> None:
-        """人手修正を反映し直す。1 操作ごとに呼ぶ（軽い）。"""
+        """人手修正を反映し直す。1 操作ごとに呼ぶ（軽い）。
+
+        negative_regions も一緒に通す。ここで落とさないと UI 上だけ
+        ポスターや鏡の誤検出が復活して見え、無駄な delete を積むことになる。
+        """
         self._merged = {}
         for path, track in self.tracked.items():
             ops = self.edits.effective(clip=path.name)
-            self._merged[path] = apply_manual(track, ops)
+            self._merged[path] = apply_manual(
+                track, ops, negative_regions=self.negative_regions
+            )
 
     @property
     def site(self) -> Optional[Site]:
@@ -129,27 +186,38 @@ class ReviewSession:
             return None
         return self.sites[min(self.index, len(self.sites) - 1)]
 
+    def fps_of(self, clip_path: Path) -> float:
+        track = self.tracked.get(clip_path)
+        return track.fps if track else 30.0
+
+    @property
+    def current_frame(self) -> int:
+        """今見ているフレーム番号。**時刻の内部表現はこれ。**"""
+        site = self.site
+        if site is None:
+            return 0
+        fps = self.fps_of(site.clip)
+        return max(0, int(round(site.start * fps)) + self.frame_offset)
+
     @property
     def current_pts(self) -> float:
         site = self.site
         if site is None:
             return 0.0
-        track = self._merged.get(site.clip)
-        fps = track.fps if track else 30.0
-        return max(0.0, site.start + self.frame_offset / fps)
+        return self.current_frame / self.fps_of(site.clip)
 
     def boxes_here(self) -> List:
         site = self.site
         if site is None:
             return []
         track = self._merged.get(site.clip)
-        return track.at_pts(self.current_pts) if track else []
+        return track.at_frame(self.current_frame) if track else []
 
     def frame_here(self) -> Optional[np.ndarray]:
         site = self.site
         if site is None or self._cache is None:
             return None
-        return self._cache.get(site.clip, self.current_pts)
+        return self._cache.get(site.clip, self.current_frame)
 
     def composed(self) -> Optional[np.ndarray]:
         """今のフレームに、今の箱でマスクを合成した絵。窓に出すのはこれ。"""
@@ -177,8 +245,7 @@ class ReviewSession:
         site = self.site
         if site is None:
             return
-        track = self._merged.get(site.clip)
-        fps = track.fps if track else 30.0
+        fps = self.fps_of(site.clip)
         span = max(1, int(round((site.end - site.start) * fps)))
         # サイトの前後 1 秒までは行き来できるようにする。
         margin = int(round(fps))

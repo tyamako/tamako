@@ -482,10 +482,10 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 def cmd_fix(args: argparse.Namespace) -> int:
     """要確認の箇所を順に開いて直す（人が仕上げる工程）。"""
     from .fix import FixError, ReviewSession, run_window
-    from .manual import ManualEdits
+    from .manual import OP_ADJUST
     from .pipeline import (
         analyze_clips, collect_clips, collect_sites, merge_manual,
-        run_detection, track_clips,
+        negative_regions_for, run_detection, track_clips,
     )
     from .sites import describe_sites, summarize_sites
 
@@ -499,10 +499,12 @@ def cmd_fix(args: argparse.Namespace) -> int:
     plans = analyze_clips(clips, config, face_model=args.face_model, on_progress=_status)
     detections = run_detection(clips, config, face_model=args.face_model)
     tracked = track_clips(clips, config, detections, on_progress=_status)
-    tracked, edits = merge_manual(clips, tracked, config)
+    # merge_manual の結果はサイト算出にだけ使う。ReviewSession には生の
+    # tracked を渡す（refresh が人手修正を当てるので、渡すと二重に当たる）。
+    merged, edits = merge_manual(clips, tracked, config)
     _clear_status()
 
-    sites = collect_sites(plans, tracked, edits=edits, config=config)
+    sites = collect_sites(plans, merged, edits=edits, config=config)
 
     _print(summarize_sites(sites, out_duration=sum(p.kept_seconds for _, p in plans)))
     _print("")
@@ -510,6 +512,12 @@ def cmd_fix(args: argparse.Namespace) -> int:
     _print(describe_sites(sites, limit=30))
     _print("")
     _print(f"  これまでの修正: {len(edits.effective())} 件  ({edits.path})")
+    if any(op.op == OP_ADJUST for op in edits.effective()):
+        _print("")
+        _print("  ※ 位置調整が二重に当たっていた不具合を直しました。過去に記録した")
+        _print("     scale / dx / dy は効きが以前の半分になり、被覆が減ったぶん")
+        _print("     確認済みが失効して要確認が増えて見えます。調整済みの箇所は")
+        _print("     一度見直してください。")
 
     if args.list_only:
         return 0
@@ -523,6 +531,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         mask_path=mask_path,
         mask_scale=float(mask_cfg["scale"]),
         mask_offset_y=float(mask_cfg.get("offset_y", 0.0)),
+        negative_regions=negative_regions_for(config),
     )
     try:
         return run_window(session)
