@@ -1,16 +1,17 @@
-"""人が仕上げる工程の窓と、その土台。
+"""人が仕上げる工程の土台。画面は持たない。
 
-設計の要点は 2 つ。
+**修正の確認に動画ファイルを焼かない。** 箱を動かしている最中に、その場で
+合成した結果を見せる。フレームはすでにメモリにあり、合成は数ミリ秒で終わる。
+1 箇所直すたびに動画 1 本を再符号化するのは、人 1 人の修正に対して
+18000 フレームの機械作業をさせることになる。
 
-1. **修正の確認に動画ファイルを焼かない。** 箱を動かしている最中に、その場で
-   合成した結果を見せる。フレームはすでにメモリにあり、合成は数ミリ秒で終わる。
-   1 箇所直すたびに動画 1 本を再符号化するのは、人 1 人の修正に対して
-   18000 フレームの機械作業をさせることになる。
-2. **cv2.selectROI は使わない。** 内部でモーダルなイベントループを回すため、
-   コマ送りと同居できず、既存の箱を掴んで動かすこともできない（最頻の操作が
-   「ずらす」なのに最悪）。setMouseCallback で自前に書くほうが短く済む。
-
-窓が開けない環境（GUI 無しの OpenCV、SSH 越しなど）でも、選別と一覧は動く。
+ここにあった cv2 の窓（run_window）は削除した。窓は `WINDOW_NORMAL` の
+リサイズで座標がずれ、`putText` が日本語を描けず、そして何より
+`current_pts` がサイトから導かれるため**要確認箇所の外を見られない**——
+機械が気づかなかった漏れを直せないのでは、この道具の目的そのものに反する。
+置き換え先はブラウザ UI（webui.py）で、この ReviewSession をそのまま使う。
+窓を残したまま並行開発はしない。座標明示 API に開くとシグネチャが変わり、
+消す予定のコードを書き直すことになる。
 """
 
 from __future__ import annotations
@@ -323,114 +324,3 @@ class ReviewSession:
             self.refresh()
         return operation
 
-
-# ------------------------------------------------------------------ 窓
-
-_HELP = [
-    "左ドラッグ: 箱を足す   右クリック: その箱を消す",
-    "+/-: 大きく/小さく   h j k l: 左下上右にずらす",
-    ", .: コマ送り   n p: 次/前のサイト",
-    "c: 確認済み   x: この区間を落とす   u: 元に戻す   q: 終了",
-]
-
-
-def run_window(session: ReviewSession, *, title: str = "tamako fix") -> int:
-    """箱を引く窓。修正のたびに、その場で合成し直して見せる。"""
-    import cv2
-
-    state = {"drag": None, "cursor": (0, 0), "quit": False}
-
-    def on_mouse(event, x, y, flags, _param):
-        state["cursor"] = (x, y)
-        if event == cv2.EVENT_LBUTTONDOWN:
-            state["drag"] = [x, y, x, y]
-        elif event == cv2.EVENT_MOUSEMOVE and state["drag"]:
-            state["drag"][2:] = [x, y]
-        elif event == cv2.EVENT_LBUTTONUP and state["drag"]:
-            x0, y0, x1, y1 = state["drag"]
-            state["drag"] = None
-            w, h = abs(x1 - x0), abs(y1 - y0)
-            if w > 8 and h > 8:
-                session.add_box((min(x0, x1), min(y0, y1), w, h))
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            session.delete_at((x, y))
-
-    try:
-        cv2.namedWindow(title, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(title, on_mouse)
-    except cv2.error as exc:
-        raise FixError(
-            "窓を開けませんでした。GUI の無い OpenCV が入っている可能性があります。\n"
-            "  pip install opencv-python  （opencv-python-headless を置き換える）\n"
-            f"（元の例外: {exc}）"
-        ) from exc
-
-    while not state["quit"]:
-        canvas = session.composed()
-        if canvas is None:
-            break
-        canvas = canvas.copy()
-        _draw_hud(cv2, canvas, session, state)
-        cv2.imshow(title, canvas)
-
-        key = cv2.waitKey(30) & 0xFF
-        if key == 255:
-            if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
-                break
-            continue
-        cursor = state["cursor"]
-        if key == ord("q"):
-            break
-        elif key == ord("n"):
-            session.go(+1)
-        elif key == ord("p"):
-            session.go(-1)
-        elif key == ord(","):
-            session.step(-1)
-        elif key == ord("."):
-            session.step(+1)
-        elif key in (ord("+"), ord("=")):
-            session.adjust_at(cursor, scale=1.15)
-        elif key in (ord("-"), ord("_")):
-            session.adjust_at(cursor, scale=1.0 / 1.15)
-        elif key == ord("h"):
-            session.adjust_at(cursor, dx=-6)
-        elif key == ord("l"):
-            session.adjust_at(cursor, dx=+6)
-        elif key == ord("k"):
-            session.adjust_at(cursor, dy=-6)
-        elif key == ord("j"):
-            session.adjust_at(cursor, dy=+6)
-        elif key == ord("c"):
-            session.confirm()
-        elif key == ord("x"):
-            session.send_to_cut()
-        elif key == ord("u"):
-            session.undo()
-
-    cv2.destroyAllWindows()
-    return 0
-
-
-def _draw_hud(cv2, canvas, session: ReviewSession, state) -> None:
-    """今どこを見ているか、何ができるかを画面内に出す。"""
-    site = session.site
-    height = canvas.shape[0]
-    if site is not None:
-        header = (
-            f"[{session.index + 1}/{len(session.sites)}] {site.clip.name} "
-            f"{site.start:.2f}-{site.end:.2f}s  risk={site.risk:.2f}  {site.kind}"
-        )
-        cv2.putText(canvas, header, (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(canvas, header, (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    for i, line in enumerate(_HELP):
-        y = height - 8 - (len(_HELP) - 1 - i) * 16
-        cv2.putText(canvas, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(canvas, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4, (200, 255, 200), 1, cv2.LINE_AA)
-    if state["drag"]:
-        x0, y0, x1, y1 = state["drag"]
-        cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 255, 255), 2)

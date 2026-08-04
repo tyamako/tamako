@@ -480,12 +480,15 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
 
 def cmd_fix(args: argparse.Namespace) -> int:
-    """要確認の箇所を順に開いて直す（人が仕上げる工程）。"""
-    from .fix import FixError, ReviewSession, run_window
+    """要確認の箇所を出す（人が仕上げる工程）。
+
+    cv2 の窓は削除した。置き換え先のブラウザ UI が入るまで、このコマンドは
+    一覧までを受け持つ。
+    """
     from .manual import OP_ADJUST
     from .pipeline import (
         analyze_clips, collect_clips, collect_sites, merge_manual,
-        negative_regions_for, run_detection, track_clips,
+        run_detection, track_clips,
     )
     from .sites import describe_sites, summarize_sites
 
@@ -519,28 +522,14 @@ def cmd_fix(args: argparse.Namespace) -> int:
         _print("     確認済みが失効して要確認が増えて見えます。調整済みの箇所は")
         _print("     一度見直してください。")
 
-    if args.list_only:
-        return 0
-    if not sites:
-        _print("直すところはありません。")
+    if args.list_only or not sites:
         return 0
 
-    mask_cfg = config.section("mask")
-    session = ReviewSession(
-        clips=list(clips), tracked=tracked, sites=sites, edits=edits,
-        mask_path=mask_path,
-        mask_scale=float(mask_cfg["scale"]),
-        mask_offset_y=float(mask_cfg.get("offset_y", 0.0)),
-        negative_regions=negative_regions_for(config),
-    )
-    try:
-        return run_window(session)
-    except FixError as exc:
-        _print("")
-        _print(str(exc))
-        _print("")
-        _print("窓が使えない場合でも、--list で確認箇所の一覧は出せます。")
-        return 1
+    _print("")
+    _print("箱を直す画面は今 OpenCV の窓からブラウザに移している最中です。")
+    _print("それまでは、直したい箇所を確認用に短く書き出せます:")
+    _print("  tamako remask")
+    return 0
 
 
 def cmd_transcribe(args: argparse.Namespace) -> int:
@@ -723,11 +712,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_self.set_defaults(func=cmd_selftest)
 
     p_fix = subparsers.add_parser("fix", parents=[common, folders],
-                                  help="要確認の箇所を順に開いて直す")
+                                  help="要確認の箇所を危険度順に出す")
     p_fix.add_argument("--review", action="store_true",
-                       help="危険度順に開く（既定の動作）")
+                       help="（互換のため残しています。今は既定の動作です）")
     p_fix.add_argument("--list", dest="list_only", action="store_true",
-                       help="一覧を出すだけで窓は開かない")
+                       help="一覧だけを出す")
     p_fix.set_defaults(func=cmd_fix)
 
     p_tr = subparsers.add_parser("transcribe", parents=[common],

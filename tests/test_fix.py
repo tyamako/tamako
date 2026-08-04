@@ -71,6 +71,19 @@ def _mask_file(tmp: Path) -> Path:
     return path
 
 
+def test_no_cv2_window_entry_point() -> None:
+    """cv2 の窓は残さない。**退路を断つための試験。**
+
+    窓を残したままブラウザ UI を書くと、ReviewSession を座標明示 API に
+    開いた時点で窓側の全メソッドのシグネチャが変わり、消す予定のコードを
+    書き直すことになる。「途中で止めても壊れない」が成立しなくなる。
+    """
+    import tamako.fix as fix
+
+    for name in ("run_window", "_draw_hud", "_HELP"):
+        assert not hasattr(fix, name), f"{name} が復活している"
+
+
 # ------------------------------------------------------------ FrameCache
 
 

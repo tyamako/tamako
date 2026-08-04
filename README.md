@@ -78,29 +78,18 @@ ffmpeg は自動で入るので、別途インストールする必要はあり�
 
 **要確認が 0 箇所なら、この工程は飛ばして構いません。**
 
-`scripts\1b_fix.bat` をダブルクリックすると、確認用の書き出し → 修正の窓 → 反映まで通しでやってくれます。コマンドで使う場合は次の 2 つです。
+`scripts\1b_fix.bat` をダブルクリックすると、確認用の書き出し → 要確認の一覧 → 反映まで通しでやってくれます。コマンドで使う場合は次の 2 つです。
 
 ```
 tamako remask     要確認の箇所の前後だけを短く書き出す（output\_review\review.mp4）
-tamako fix        その箇所を順に開いて直す
+tamako fix        その箇所を危険度順に一覧で出す
 ```
 
 `remask` は**素材と同じ解像度**で書き出します。粗い画質にすると「顎が少し出ている」ような漏れが見えなくなるためです。短いので、10 分の動画でも確認は 1〜2 分で終わります。
 
-`tamako fix` は窓を開いて、危険度の高い箇所から順に見せます。箱を動かしている最中に合成結果がその場で更新されるので、動画を出し直す必要はありません。
+`tamako fix` は、危険度の高い箇所から順に一覧で見せます。
 
-| 操作 | できること |
-| --- | --- |
-| 左ドラッグ | 隠れていない顔に箱を足す |
-| 右クリック | 顔でないものを隠している箱を消す |
-| `+` `-` | 箱を大きく／小さく |
-| `h` `j` `k` `l` | 左・下・上・右にずらす |
-| `,` `.` | コマ送り |
-| `n` `p` | 次／前の箇所へ |
-| `c` | 確認済みにする（次回から出ません） |
-| `x` | ここは直せないので区間ごと落とす |
-| `u` | 元に戻す |
-| `q` | 終了 |
+> **箱を直す画面は入れ替え作業中です。** これまでの OpenCV の窓は削除しました。窓はリサイズすると座標がずれ、日本語が描けず、そして何より**要確認箇所の外を見られない**——機械が気づかなかった漏れを直せないのでは、この道具の目的そのものに反します。置き換え先はブラウザの画面です。それまでは `remask` で確認し、`output\.tamako_work\faces_manual.jsonl` を直接編集するか、次の版をお待ちください。
 
 直した内容は `output\.tamako_work\faces_manual.jsonl` に残ります。**`tamako edit` をもう一度実行すると、その修正を反映した状態で書き出し直されます。** 顔検出はやり直さないので速いです。
 
@@ -136,7 +125,7 @@ tamako detect                   顔検出だけを先に走らせる（結果は
 tamako check                    書き出さずに並び順とカット結果を見る
 tamako edit                     並べる・切る・顔を隠す
 tamako remask                   要確認の箇所だけを短く書き出す
-tamako fix                      要確認の箇所を順に開いて直す
+tamako fix                      要確認の箇所を危険度順に一覧で出す
 tamako selftest                 確認用と本番で同じものを描いているか検査する
 tamako transcribe --audio 音声  文字起こしして SRT だけ作る
 tamako subtitle --video 動画 --srt 字幕 [--audio 音声]   字幕を焼き込む
@@ -154,7 +143,7 @@ tamako finish --video 動画 --audio 音声                  上の 2 つをま�
 
 edit --only 開始-終了   その範囲だけを本番画質で書き出す
 edit --diagnostic       マスクの代わりに「実際に隠れる範囲」を色で塗る
-fix  --list             窓を開かず一覧だけ出す
+fix  --list             一覧だけを出す
 ```
 
 **顔検出は 1 回だけ走ります。** 結果は `output\.tamako_work\detect` に保存され、素材と検出設定が変わらない限り再利用されます。マスクの大きさを変えて出し直すのは速いです。
@@ -249,9 +238,6 @@ fix  --list             窓を開かず一覧だけ出す
 `https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx`
 を手動で入手し、`%LOCALAPPDATA%\tamako\face_detection_yunet_2023mar.onnx` に置いてください。
 
-**`tamako fix` で「窓を開けませんでした」と出る**
-GUI の無い OpenCV が入っています。`pip install opencv-python` で入れ直してください（`opencv-python-headless` を置き換えます）。窓が使えなくても `tamako fix --list` で確認箇所の一覧は出せます。
-
 **「設定ファイルに未知のキーがあります」**
 綴り間違いです。`mask.score_treshold` のように入れ子の中を間違えた場合も指摘されます。
 
@@ -316,7 +302,7 @@ src/tamako/
   segments.py    区間演算とカット判定（動画に触れない純粋な計算）
   sites.py       要確認箇所の集約と危険度
   manual.py      人手修正の記録とマージ、確認済みの管理
-  fix.py         確認と修正の窓
+  fix.py         確認と修正の土台（画面は持たない）
   overlay.py     PNG 合成とマスクの実効被覆
   render.py      書き出し
   report.py      記録の書き出し
