@@ -255,6 +255,23 @@ def manual_cut_intervals(operations: Sequence[Operation]) -> List[Tuple[float, f
     return [(op.start, op.end) for op in operations if op.op == OP_CUT]
 
 
+def shrunk_intervals(operations: Sequence[Operation]) -> List[Tuple[float, float]]:
+    """人が箱を小さくした区間。
+
+    縮小は人手操作で唯一、素顔を出しうる操作。しかも結果の箱は
+    source=manual / uncertain=False になるので sites.py のどの分岐にも
+    入らず、確認済みを無効に戻してもサイトが生まれない。明示的に拾う。
+
+    op.data の未知キーは Operation.data に落ちるだけなので、shrunk を
+    足しても faces_manual.jsonl の形式は変わらない（tamako edit は無改造）。
+    """
+    return [
+        (op.start, op.end) for op in operations
+        if op.op == OP_ADJUST
+        and (bool(op.data.get("shrunk")) or float(op.data.get("scale", 1.0)) < 1.0)
+    ]
+
+
 # ---------------------------------------------------------------- 確認済み
 
 SIGNATURE_W, SIGNATURE_H = 32, 18

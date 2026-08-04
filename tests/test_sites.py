@@ -8,25 +8,31 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from tamako.sites import (
-    KIND_ESTIMATED, KIND_NO_MASK, KIND_UNCERTAIN,
+    KIND_ESTIMATED, KIND_LOST_TRACK, KIND_NO_MASK, KIND_SHRUNK, KIND_UNCERTAIN,
     apply_cut_policy, build_sites, uncovered_intervals,
 )
 from tamako.tracks import (
-    SOURCE_DETECTED, SOURCE_EXTRAP, SOURCE_INTERP, PlacedBox, TrackedClip,
+    SOURCE_DETECTED, SOURCE_EXTRAP, SOURCE_INTERP, PlacedBox, Track, TrackedClip,
 )
 
 FPS = 10.0
 CLIP = Path("a.mp4")
 
 
-def _tracked(boxes_by_frame) -> TrackedClip:
+def _tracked(boxes_by_frame, *, scene_breaks=(), tracks=()) -> TrackedClip:
     return TrackedClip(fps=FPS, width=640, height=360, frames_total=100,
-                       boxes=dict(boxes_by_frame))
+                       boxes=dict(boxes_by_frame),
+                       tracks=list(tracks), scene_breaks=list(scene_breaks))
 
 
-def _box(source=SOURCE_DETECTED, uncertain=False) -> PlacedBox:
-    return PlacedBox(x=10, y=10, w=40, h=40, source=source,
-                     track_id="t1", score=0.9, uncertain=uncertain)
+def _track(track_id: str, frames) -> Track:
+    return Track(track_id=track_id,
+                 frames={f: _box(track_id=track_id) for f in frames})
+
+
+def _box(source=SOURCE_DETECTED, uncertain=False, track_id="t1", x=10) -> PlacedBox:
+    return PlacedBox(x=x, y=10, w=40, h=40, source=source,
+                     track_id=track_id, score=0.9, uncertain=uncertain)
 
 
 def test_no_mask_frames_become_one_site() -> None:
@@ -102,6 +108,129 @@ def test_confirmed_ranges_are_skipped() -> None:
                           duration=3.0, skip=[(0.0, 2.0)])
     for site in partial:
         assert site.start >= 2.0 - 1e-6, f"確認済みの区間が出ている: {site}"
+
+
+def test_partial_detection_is_reported() -> None:
+    """2 人写っていて 1 人だけ検出できているフレームが一覧に出る。
+
+    フレームに箱が 1 つでもあれば no_mask にしないので、この最も起きやすい
+    漏れが、以前は原理的にリストへ現れなかった（サイト 0 件）。
+    """
+    # b が 20〜29 のあいだ検出できず、30 で別トラックとして取り直される。
+    # フレームには常に a の箱があるので、今の 3 種類では何も出ない。
+    boxes = {}
+    for f in range(50):
+        row = [_box(track_id="a", x=10)]
+        if not (20 <= f < 30):
+            row.append(_box(track_id="b" if f < 20 else "b2", x=300))
+        boxes[f] = row
+    tracked = _tracked(boxes, tracks=[
+        _track("a", range(50)), _track("b", range(20)), _track("b2", range(30, 50)),
+    ])
+
+    sites = build_sites(CLIP, tracked, [(0.0, 5.0)], [], duration=5.0)
+    lost = [s for s in sites if s.kind == KIND_LOST_TRACK]
+    assert lost, f"1 人だけ検出のフレームが報告されていない: {sites}"
+    assert abs(lost[0].start - 2.0) < 1e-6 and abs(lost[0].end - 3.0) < 1e-6, lost[0]
+    assert "もう 1 人" in lost[0].action()
+    assert "b" in lost[0].track_ids
+
+
+def test_lost_track_ignores_scene_breaks() -> None:
+    """場面が変わって人が入れ替わっただけの箇所は出さない。"""
+    boxes = {}
+    for f in range(50):
+        boxes[f] = [_box(track_id="a", x=10)] + (
+            [_box(track_id="b", x=300)] if f < 20 else []
+        )
+    tracked = _tracked(boxes, scene_breaks=[20], tracks=[
+        _track("a", range(50)), _track("b", range(20)),
+    ])
+    sites = build_sites(CLIP, tracked, [(0.0, 5.0)], [], duration=5.0)
+    assert not [s for s in sites if s.kind == KIND_LOST_TRACK], sites
+
+
+def test_lost_track_uses_detections_not_filled_boxes() -> None:
+    """補間で埋めた区間は「人数が減った」にしない（それは推定で覆っている）。"""
+    boxes = {f: [_box(track_id="a", x=10), _box(SOURCE_INTERP, track_id="b", x=300)]
+             for f in range(50)}
+    tracked = _tracked(boxes, tracks=[
+        _track("a", range(50)),
+        _track("b", list(range(20)) + list(range(30, 50))),  # 20〜29 は補間で埋まる
+    ])
+    sites = build_sites(CLIP, tracked, [(0.0, 5.0)], [], duration=5.0)
+    assert not [s for s in sites if s.kind == KIND_LOST_TRACK], sites
+
+
+def test_site_has_max_length() -> None:
+    """長すぎるサイトは分割される。
+
+    上限が無いと 20 秒の no_mask が 1 件でき、「サイト全体に効かせる」を
+    既定にした瞬間、静止した箱を 20 秒に効かせることになる。
+    """
+    boxes = {f: [] for f in range(200)}
+    sites = build_sites(CLIP, _tracked(boxes), [(0.0, 20.0)], [],
+                        duration=20.0, max_site_sec=5.0)
+    assert len(sites) >= 4, f"分割されていない: {[(s.start, s.end) for s in sites]}"
+    for site in sites:
+        assert site.duration <= 5.0 + 1e-6, f"上限を超えている: {site.duration}"
+    # 区間としては隙間なく元の範囲を覆う。
+    ordered = sorted(sites, key=lambda s: s.start)
+    assert abs(ordered[0].start - 0.0) < 1e-6
+    assert abs(ordered[-1].end - 20.0) < 1e-6
+    for a, b in zip(ordered, ordered[1:]):
+        assert abs(a.end - b.start) < 1e-6, f"隙間がある: {a.end} → {b.start}"
+
+
+def test_shrunk_box_is_reported() -> None:
+    """人が縮めた区間は必ず 1 度は出す。
+
+    縮小した箱は source=manual / uncertain=False なので他のどの分岐にも
+    入らない。確認済みを無効に戻しても、サイトが生まれなかった。
+    """
+    from tamako.tracks import SOURCE_MANUAL
+
+    boxes = {f: [_box(SOURCE_MANUAL)] for f in range(30)}
+    assert not build_sites(CLIP, _tracked(boxes), [(0.0, 3.0)], [], duration=3.0)
+
+    sites = build_sites(CLIP, _tracked(boxes), [(0.0, 3.0)], [], duration=3.0,
+                        shrunk=[(1.0, 2.0)])
+    shrunk = [s for s in sites if s.kind == KIND_SHRUNK]
+    assert shrunk, f"縮めた区間が報告されていない: {sites}"
+    assert abs(shrunk[0].start - 1.0) < 1e-6 and abs(shrunk[0].end - 2.0) < 1e-6
+    # 確認済みにすれば消える（永久に出続けはしない）。
+    assert not [
+        s for s in build_sites(CLIP, _tracked(boxes), [(0.0, 3.0)], [],
+                               duration=3.0, shrunk=[(1.0, 2.0)],
+                               skip=[(0.0, 3.0)])
+        if s.kind == KIND_SHRUNK
+    ]
+
+
+def test_shrunk_intervals_from_operations() -> None:
+    """scale < 1.0 と shrunk フラグの両方を拾う。形式は変えない。"""
+    from tamako.manual import OP_ADJUST, Operation, shrunk_intervals
+
+    ops = [
+        Operation(op=OP_ADJUST, clip="a.mp4", start=0.0, end=1.0,
+                  data={"scale": 0.8}),
+        Operation(op=OP_ADJUST, clip="a.mp4", start=2.0, end=3.0,
+                  data={"scale": 1.0, "shrunk": True}),
+        Operation(op=OP_ADJUST, clip="a.mp4", start=4.0, end=5.0,
+                  data={"scale": 1.2}),
+    ]
+    assert shrunk_intervals(ops) == [(0.0, 1.0), (2.0, 3.0)]
+
+
+def test_listing_does_not_claim_completeness() -> None:
+    """一覧を「網羅」と偽らない。"""
+    from tamako.sites import summarize_sites
+
+    boxes = {f: [] for f in range(30)}
+    sites = build_sites(CLIP, _tracked(boxes), [(0.0, 3.0)], [], duration=3.0)
+    for text in (summarize_sites(sites, out_duration=3.0),
+                 summarize_sites([], out_duration=3.0)):
+        assert "これで全部ではありません" in text, text
 
 
 def test_cut_policy_removes_uncovered() -> None:

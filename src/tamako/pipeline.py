@@ -249,6 +249,7 @@ def collect_sites(
     config: Optional[Config] = None,
 ) -> list:
     """全素材のサイトを危険度順に集める。確認済みの区間は出さない。"""
+    from .manual import shrunk_intervals
     from .sites import build_sites
 
     sites = []
@@ -257,11 +258,15 @@ def collect_sites(
         if track is None:
             continue
         skip: List[Tuple[float, float]] = []
+        shrunk: List[Tuple[float, float]] = []
+        if edits is not None:
+            shrunk = shrunk_intervals(edits.effective(clip=clip.path.name))
         if edits is not None and config is not None:
             skip = confirmed_spans(clip, track, edits, config)
         sites.extend(build_sites(
             clip.path, track, plan.keep, plan.silent,
-            duration=clip.info.duration, min_site_sec=min_site_sec, skip=skip,
+            duration=clip.info.duration, min_site_sec=min_site_sec,
+            skip=skip, shrunk=shrunk,
         ))
     sites.sort(key=lambda s: s.risk, reverse=True)
     return sites

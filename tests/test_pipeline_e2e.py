@@ -115,10 +115,10 @@ def main() -> None:
 
         # --- 確認箇所の抜き出し（フル解像度であること） ---
         listing = _run(["fix", *args, "--list"], work)
-        assert "要確認のサイト" in listing
+        assert "機械が気づいた箇所" in listing
         # 窓は無い。GUI の無い環境でも fix が最後まで走り切る。
-        assert "要確認のサイト" in _run(["fix", *args], work)
-        if "要確認のサイト: 0 箇所" not in listing:
+        assert "機械が気づいた箇所" in _run(["fix", *args], work)
+        if "機械が気づいた箇所: 0 箇所" not in listing:
             _run(["remask", *args], work)
             review = work / "output" / "_review" / "review.mp4"
             assert review.is_file()
