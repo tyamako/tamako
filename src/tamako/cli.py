@@ -522,14 +522,54 @@ def cmd_fix(args: argparse.Namespace) -> int:
         _print("     確認済みが失効して要確認が増えて見えます。調整済みの箇所は")
         _print("     一度見直してください。")
 
-    if args.list_only or not sites:
+    if args.list_only:
         return 0
 
+    # サイトが 0 件でも開く。機械が気づかなかった漏れを探すのが本来の目的で、
+    # 一覧は網羅ではない。
+    from .fix import FixError, ReviewSession
+    from .pipeline import detection_work_dir, negative_regions_for
+    from .webui import serve
+
+    mask_cfg = config.section("mask")
+    session = ReviewSession(
+        clips=list(clips), tracked=tracked, sites=sites, edits=edits,
+        mask_path=mask_path,
+        mask_scale=float(mask_cfg["scale"]),
+        mask_offset_y=float(mask_cfg.get("offset_y", 0.0)),
+        negative_regions=negative_regions_for(config),
+    )
+    _check_fps_agreement(clips, tracked)
+
     _print("")
-    _print("箱を直す画面は今 OpenCV の窓からブラウザに移している最中です。")
-    _print("それまでは、直したい箇所を確認用に短く書き出せます:")
-    _print("  tamako remask")
-    return 0
+    try:
+        return serve(
+            session, port=args.port, open_browser=not args.no_browser,
+            log_path=detection_work_dir(config) / "webui.log",
+            on_url=lambda url: (
+                _print("ブラウザで開いてください（このアドレスは他人に見せないでください）:"),
+                _print(f"  {url}"),
+                _print(""),
+                _print("終わったら画面の「終了」か、この窓で Ctrl+C。"),
+            ),
+        )
+    except FixError as exc:
+        _print(str(exc))
+        return 1
+
+
+def _check_fps_agreement(clips, tracked) -> None:
+    """検出時のメタ行の fps と probe の fps が食い違っていないか。
+
+    (clip, frame) を権威にする以上、ここがずれると箱と絵が別のフレームを
+    指し始める（VFR 素材で起きる）。
+    """
+    for clip in clips:
+        track = tracked.get(clip.path)
+        if track and abs(track.fps - clip.info.fps) > 1e-3:
+            _print(f"  ※ {clip.name} の fps が検出時 ({track.fps:.4f}) と "
+                   f"素材 ({clip.info.fps:.4f}) で食い違っています。"
+                   "箱と絵が別のフレームを指すおそれがあります。")
 
 
 def cmd_transcribe(args: argparse.Namespace) -> int:
@@ -712,11 +752,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_self.set_defaults(func=cmd_selftest)
 
     p_fix = subparsers.add_parser("fix", parents=[common, folders],
-                                  help="要確認の箇所を危険度順に出す")
+                                  help="ブラウザで顔隠しを直す")
     p_fix.add_argument("--review", action="store_true",
                        help="（互換のため残しています。今は既定の動作です）")
     p_fix.add_argument("--list", dest="list_only", action="store_true",
-                       help="一覧だけを出す")
+                       help="一覧だけを出して画面は開かない")
+    p_fix.add_argument("--port", type=int, default=0,
+                       help="待ち受けポート（既定: 0 = 空いているものを使う）")
+    p_fix.add_argument("--no-browser", action="store_true",
+                       help="ブラウザを自動で開かない")
     p_fix.set_defaults(func=cmd_fix)
 
     p_tr = subparsers.add_parser("transcribe", parents=[common],

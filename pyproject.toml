@@ -21,3 +21,7 @@ tamako = "tamako.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# 画面の HTML は配布物に入れる。packages.find だけでは .py しか入らない。
+tamako = ["fixui.html"]

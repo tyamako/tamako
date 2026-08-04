@@ -31,7 +31,7 @@ echo output\_review\review.mp4 を再生して、隠しきれていない箇所�
 echo （このフォルダには素顔が写っています。人に渡さないでください）
 echo.
 set "ANSWER="
-set /p ANSWER="直すところがありますか？ (y = 要確認の一覧を出す / それ以外 = 終了): "
+set /p ANSWER="直すところがありますか？ (y = ブラウザで直す画面を開く / それ以外 = 終了): "
 if /i not "%ANSWER%"=="y" (
     echo.
     echo 終了しました。声を録ったら scripts\2_finish.bat を実行してください。
@@ -40,6 +40,7 @@ if /i not "%ANSWER%"=="y" (
 )
 
 echo.
+echo ブラウザが開きます。終わったら画面の「終了」を押してください。
 python -m tamako fix --config config.json
 if errorlevel 1 (
     echo.

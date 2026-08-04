@@ -207,32 +207,51 @@ class ReviewSession:
             return 0.0
         return self.current_frame / self.fps_of(site.clip)
 
-    def boxes_here(self) -> List:
-        site = self.site
-        if site is None:
-            return []
-        track = self._merged.get(site.clip)
-        return track.at_frame(self.current_frame) if track else []
+    # 座標明示の入口。**サイトに縛られない。** 機械が気づかなかった漏れを
+    # 直せることがこの道具の目的なので、要確認箇所の外も同じ API で見られる。
 
-    def frame_here(self) -> Optional[np.ndarray]:
-        site = self.site
-        if site is None or self._cache is None:
-            return None
-        return self._cache.get(site.clip, self.current_frame)
+    def boxes_at(self, clip_path: Path, frame: int) -> List:
+        track = self._merged.get(clip_path)
+        return track.at_frame(frame) if track else []
 
-    def composed(self) -> Optional[np.ndarray]:
-        """今のフレームに、今の箱でマスクを合成した絵。窓に出すのはこれ。"""
-        frame = self.frame_here()
-        if frame is None:
+    def frame_at(self, clip_path: Path, frame: int) -> Optional[np.ndarray]:
+        return self._cache.get(clip_path, frame) if self._cache is not None else None
+
+    def composed_at(self, clip_path: Path, frame: int) -> Optional[np.ndarray]:
+        """素材の 1 枚に、今の箱でマスクを合成した絵。画面に出すのはこれ。"""
+        image = self.frame_at(clip_path, frame)
+        if image is None:
             return None
-        canvas = frame.copy()
-        for box in self.boxes_here():
+        canvas = image.copy()
+        for box in self.boxes_at(clip_path, frame):
             cx, cy = box.center
             cy += box.h * self.mask_offset_y
             w = box.w * self._scale_eff
             h = box.h * self._scale_eff
             composite(canvas, self._mask, _Rect(cx - w / 2, cy - h / 2, w, h))
         return canvas
+
+    @property
+    def scale_eff(self) -> float:
+        """設定の scale を、マスクの実効被覆で補正した値。
+
+        人が引く矩形は**顔の箱**として記録され、実際に貼られるのはこれを
+        掛けた矩形。円形ステッカーなら被覆比 ≈0.70 なので 2.0/0.70 ≈ 2.86 倍、
+        面積では約 8 倍が隠れる。画面はこれを見せないと嘘をつくことになる。
+        """
+        return self._scale_eff
+
+    def boxes_here(self) -> List:
+        site = self.site
+        return [] if site is None else self.boxes_at(site.clip, self.current_frame)
+
+    def frame_here(self) -> Optional[np.ndarray]:
+        site = self.site
+        return None if site is None else self.frame_at(site.clip, self.current_frame)
+
+    def composed(self) -> Optional[np.ndarray]:
+        site = self.site
+        return None if site is None else self.composed_at(site.clip, self.current_frame)
 
     # ---------------------------------------------------------- 移動
 

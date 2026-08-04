@@ -65,6 +65,73 @@ def _durations(path: Path):
     return out
 
 
+def _fix_ui_round_trip(work: Path, args) -> None:
+    """`tamako fix` が実素材でブラウザ UI を開き、絵を返し、終了できること。
+
+    test_webui.py は偽の読み手で門番だけを見る。ここでは実際の ffmpeg 越しに
+    (clip, frame) → JPEG が返るところまでを通す。**cmd_fix の配線の試験。**
+    """
+    import re
+    import time
+    import urllib.error
+    import urllib.request
+
+    log = work / "fix_ui.log"
+    with log.open("w", encoding="utf-8") as handle:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "tamako", "fix", *args, "--no-browser", "--port", "0"],
+            cwd=work, stdout=handle, stderr=subprocess.STDOUT,
+            env={**dict(__import__("os").environ), "PYTHONPATH": str(ROOT / "src")},
+        )
+    try:
+        url = None
+        for _ in range(600):
+            if proc.poll() is not None:
+                raise AssertionError(f"fix が終了しました\n{log.read_text('utf-8')}")
+            found = re.search(r"http://127\.0\.0\.1:\d+/\?t=\S+", log.read_text("utf-8"))
+            if found:
+                url = found.group(0)
+                break
+            time.sleep(0.25)
+        assert url, f"待ち受けアドレスが出ない\n{log.read_text('utf-8')}"
+
+        base, token = url.split("/?t=")
+
+        def call(path, data=None):
+            request = urllib.request.Request(
+                f"{base}{path}",
+                data=None if data is None else json.dumps(data).encode(),
+                method="POST" if data is not None else "GET",
+            )
+            request.add_header("Cookie", f"tamako_fix={token}")
+            if data is not None:
+                request.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.status, response.read()
+
+        state = json.loads(call("/api/state")[1])
+        assert state["clips"], state
+        assert state["mask_scale_eff"] > 2.0, "実効倍率が補正されていない"
+        clip = state["clips"][0]
+
+        code, body = call(f"/api/frame?clip={clip['name']}&frame=1")
+        assert code == 200 and body[:2] == b"\xff\xd8", "JPEG が返らない"
+        # 素材の終端を越えても落ちない（以前は FFmpegError で工程ごと終了した）。
+        try:
+            call(f"/api/frame?clip={clip['name']}&frame={clip['frames'] + 5}")
+            raise AssertionError("終端の外が 404 になっていない")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404, exc.code
+        assert proc.poll() is None, "終端の要求でサーバが落ちた"
+
+        assert call("/api/quit", {})[0] == 200
+        assert proc.wait(timeout=30) == 0, log.read_text("utf-8")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -116,8 +183,7 @@ def main() -> None:
         # --- 確認箇所の抜き出し（フル解像度であること） ---
         listing = _run(["fix", *args, "--list"], work)
         assert "機械が気づいた箇所" in listing
-        # 窓は無い。GUI の無い環境でも fix が最後まで走り切る。
-        assert "機械が気づいた箇所" in _run(["fix", *args], work)
+        _fix_ui_round_trip(work, args)
         if "機械が気づいた箇所: 0 箇所" not in listing:
             _run(["remask", *args], work)
             review = work / "output" / "_review" / "review.mp4"
