@@ -9,7 +9,7 @@ description = "撮影素材を撮影順に並べ、不要区間を切り、顔�
 requires-python = ">=3.9"
 dependencies = [
     "imageio-ffmpeg>=0.5.1",
-    "opencv-python-headless>=4.9",
+    "opencv-python>=4.9",
     "numpy>=1.24",
 ]
 
@@ -21,3 +21,7 @@ tamako = "tamako.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# 画面の HTML は配布物に入れる。packages.find だけでは .py しか入らない。
+tamako = ["fixui.html"]

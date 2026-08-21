@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tamako fix</title>
+<style>
+  :root { color-scheme: dark; --bg:#15171b; --fg:#e8eaed; --line:#33373d; --hot:#ff5f56; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, sans-serif; }
+  #bar { display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+         padding:8px 12px; border-bottom:1px solid var(--line); }
+  #bar select, #bar button { background:#22262c; color:var(--fg);
+         border:1px solid var(--line); border-radius:6px; padding:4px 10px; font:inherit; }
+  #stage { position:relative; margin:12px auto; width:min(100%, 1100px); }
+  #stage img { display:block; width:100%; max-height:72vh; object-fit:contain; background:#000; }
+  #ov { position:absolute; inset:0; width:100%; height:100%; touch-action:none; cursor:crosshair; }
+  #stage.raw { outline:3px solid var(--hot); outline-offset:-3px; }
+  .span { font-variant-numeric:tabular-nums; color:#9fb4c7; }
+  #msg { min-height:1.6em; padding:0 12px 12px; color:#9fb4c7; }
+  #msg.warn { color:#ffcf70; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <select id="clip"></select>
+  <button id="prev">◀</button>
+  <span class="span" id="pos">0</span>
+  <button id="next">▶</button>
+  <label><input type="checkbox" id="raw"> 素材を見る</label>
+  <span class="span" id="span"></span>
+  <button id="quit">終了</button>
+</div>
+<div id="stage"><img id="img" alt=""><svg id="ov"></svg></div>
+<div id="msg">ドラッグで箱を足せます。点線が実際に隠れる範囲です。</div>
+
+<script type="module">
+const SVG = "http://www.w3.org/2000/svg";
+const $ = (id) => document.getElementById(id);
+const blobs = new Map();          // 版は持たない。編集のたびに捨てる
+let state = null, clip = null, frame = 0, drag = null;
+
+const info = () => state.clips.find((c) => c.name === clip);
+const say = (text, warn) => { $("msg").textContent = text; $("msg").classList.toggle("warn", !!warn); };
+
+async function api(path, body) {
+  const options = body
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    : undefined;
+  const response = await fetch(path, options);
+  if (!response.ok) throw new Error(`${path} ${response.status}`);
+  return response.json();
+}
+
+// --- 画像。全モード no-store なので、速度は Blob を持って稼ぐ ---------------
+function dropBlobs(prefix) {
+  for (const [key, url] of [...blobs]) {
+    if (prefix && !key.startsWith(prefix)) continue;
+    URL.revokeObjectURL(url);           // 忘れると数百 MB 漏れる
+    blobs.delete(key);
+  }
+}
+
+async function showFrame() {
+  const mode = $("raw").checked ? "raw" : "mask";
+  const key = `${clip}/${frame}/${mode}`;
+  let url = blobs.get(key);
+  if (!url) {
+    // 冷えた飛び先は実測で中央値 0.8 秒・最大 6.5 秒かかる。何も出さないと
+    // 固まったように見えるので、必ず「読んでいます」を出す。
+    const slow = setTimeout(() => say("読んでいます…"), 200);
+    const query = `clip=${encodeURIComponent(clip)}&frame=${frame}&mode=${mode}`;
+    const response = await fetch(`/api/frame?${query}`);
+    clearTimeout(slow);
+    if (!response.ok) { say("このフレームは読めません（素材の終端かもしれません）", true); return; }
+    url = URL.createObjectURL(await response.blob());
+    blobs.set(key, url);
+    if (blobs.size > 150) dropBlobs(null);
+  }
+  $("img").src = url;
+  $("stage").classList.toggle("raw", $("raw").checked);
+  await loadBoxes();
+}
+
+// --- 箱。JPEG には焼かない（焼くと 1 操作ごとに再符号化になる）-------------
+let here = [];                    // 今のフレームの箱。ドラッグ中はこれを使い回す
+
+async function loadBoxes() {
+  const size = info();
+  $("ov").setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
+  $("ov").setAttribute("preserveAspectRatio", "xMidYMid meet");
+  here = await api(`/api/boxes?clip=${encodeURIComponent(clip)}&frame=${frame}`);
+  $("pos").textContent = `${frame} / ${size.frames - 1}`;
+  paint();
+}
+
+// ドラッグのたびに取りに行かない。応答が前後して古いゴーストが残るうえ、
+// 1 回の身振りで数十往復する。描き直しは手元の配列だけで足りる。
+function paint(box) {
+  $("ov").replaceChildren();
+  for (const [x, y, w, h, , uncertain] of here) {
+    $("ov").append(rect(x, y, w, h, uncertain ? "#ffcf70" : "#5fd3ff", 2, null));
+  }
+  if (!box) return;
+  // 引いている矩形と、実際に隠れる範囲（× 実効倍率）を同時に見せる。
+  // 引いた矩形の面積の約 8 倍が隠れるので、これが無いと人は
+  // 「大きすぎるから縮める」という最も危険な経路に追い込まれる。
+  const k = state.mask_scale_eff;
+  const cx = box.x + box.w / 2, cy = box.y + box.h / 2 + box.h * state.offset_y;
+  $("ov").append(rect(cx - box.w * k / 2, cy - box.h * k / 2,
+                      box.w * k, box.h * k, "#ff5f56", 2, "6 5"));
+  $("ov").append(rect(box.x, box.y, box.w, box.h, "#7CFF9B", 2, null));
+}
+
+function rect(x, y, w, h, color, width, dash) {
+  const node = document.createElementNS(SVG, "rect");
+  node.setAttribute("x", x); node.setAttribute("y", y);
+  node.setAttribute("width", Math.max(0, w)); node.setAttribute("height", Math.max(0, h));
+  node.setAttribute("fill", "none"); node.setAttribute("stroke", color);
+  node.setAttribute("stroke-width", width);
+  if (dash) node.setAttribute("stroke-dasharray", dash);
+  return node;
+}
+
+// --- 座標。手計算の変換式は書かない ----------------------------------------
+// getScreenCTM().inverse() は preserveAspectRatio・ズーム・DPI・親の CSS
+// transform のすべてに対して自動的に正しい。<img> は object-fit:contain、
+// SVG は xMidYMid meet で揃えてあるので、コンテナの大きさが何であれずれない。
+function at(event) {
+  const point = new DOMPoint(event.clientX, event.clientY);
+  return point.matrixTransform($("ov").getScreenCTM().inverse());
+}
+
+function span() {
+  // 既定は常にカーソル ±0.25 秒。長すぎる既定値は「箱はあるが顔はもういない」を
+  // 作り、しかも sites.py が要確認から外すので、漏れを隠す方向に働く。
+  const half = Math.max(1, Math.round(0.25 * info().fps));
+  return [Math.max(0, frame - half), Math.min(info().frames - 1, frame + half)];
+}
+
+function showSpan() {
+  const [a, b] = span(), fps = info().fps;
+  $("span").textContent = `効かせる範囲: ${(a / fps).toFixed(2)}–${(b / fps).toFixed(2)}s`
+    + ` (${((b - a) / fps).toFixed(2)}s)`;
+}
+
+$("ov").addEventListener("pointerdown", (event) => {
+  const point = at(event);
+  drag = { x0: point.x, y0: point.y, x1: point.x, y1: point.y };
+  $("ov").setPointerCapture(event.pointerId);   // 外で離しても置き去りにしない
+});
+
+$("ov").addEventListener("pointermove", (event) => {
+  if (!drag) return;
+  const point = at(event);
+  drag.x1 = point.x; drag.y1 = point.y;
+  paint(normal(drag));
+});
+
+$("ov").addEventListener("pointerup", async (event) => {
+  if (!drag) return;
+  const box = normal(drag);
+  drag = null;
+  $("ov").releasePointerCapture(event.pointerId);
+  if (box.w < 6 || box.h < 6) { paint(); return; }
+  const [from, to] = span();
+  const result = await api("/api/op", {
+    op: "add", clip, frame, start_frame: from, end_frame: to,
+    rect: [box.x, box.y, box.w, box.h].map((v) => Math.round(v * 100) / 100),
+  });
+  dropBlobs(`${clip}/`);
+  await showFrame();
+  say(result.affected > 1
+    ? `箱を足しました。この位置には ${result.affected} 個の箱があります（巻き込んでいないか確認してください）`
+    : "箱を足しました。faces_manual.jsonl に記録しました", result.affected > 1);
+});
+
+const normal = (d) => ({
+  x: Math.min(d.x0, d.x1), y: Math.min(d.y0, d.y1),
+  w: Math.abs(d.x1 - d.x0), h: Math.abs(d.y1 - d.y0),
+});
+
+// --- 移動。キーは補助、マウスが主経路 --------------------------------------
+async function go(delta) {
+  frame = Math.max(0, Math.min(info().frames - 1, frame + delta));
+  location.hash = `${clip}/${frame}`;
+  showSpan();
+  await showFrame();
+}
+
+$("prev").onclick = () => go(-1);
+$("next").onclick = () => go(+1);
+$("raw").onchange = () => showFrame();
+$("quit").onclick = async () => { await api("/api/quit", {}); say("終了しました。この画面は閉じて構いません。"); };
+$("clip").onchange = () => { clip = $("clip").value; frame = 0; go(0); };
+
+addEventListener("keydown", (event) => {
+  // 素材の切り替え中だけ譲る。チェックボックスやボタンに焦点が残っているだけで
+  // コマ送りが効かなくなるのは、手が止まる側の失敗として重い。
+  if (event.target.tagName === "SELECT") return;
+  const step = { ArrowLeft: -1, ArrowRight: +1, PageUp: -10, PageDown: +10 }[event.key];
+  if (step !== undefined) { event.preventDefault(); go(step); }
+  else if (event.key === "Escape" && drag) { drag = null; paint(); }
+});
+
+// --- 起動 -------------------------------------------------------------------
+(async () => {
+  state = await api("/api/state");
+  for (const entry of state.clips) {
+    const option = document.createElement("option");
+    option.value = option.textContent = entry.name;
+    $("clip").append(option);
+  }
+  const [name, at] = decodeURIComponent(location.hash.slice(1)).split("/");
+  clip = state.clips.some((c) => c.name === name) ? name : state.clips[0].name;
+  $("clip").value = clip;
+  frame = Number(at) || 0;
+  await go(0);
+})();
+</script>
+</body>
+</html>

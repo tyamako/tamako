@@ -32,6 +32,10 @@ DEFAULTS: Dict[str, Any] = {
         "padding_sec": 0.25,
         "min_keep_sec": 0.6,
         "min_cut_sec": 0.5,
+        # カット判定に使う検出解像度。mask.detect_width とは独立させてある。
+        # カットは「誤検出で残りすぎる」のが困り、マスクは「見逃して顔が出る」のが
+        # 困る、という非対称があるため、マスク側の解像度を上げてもここは変えない。
+        "detect_width": 640,
     },
     "mask": {
         # 顔隠しは検出漏れがそのまま顔バレになる。閾値は低め、箱は大きめ、
@@ -43,10 +47,21 @@ DEFAULTS: Dict[str, Any] = {
         # 重ねる位置の上下微調整（顔の高さに対する割合、負で上）。
         # 髪が多い人は少し上げるとよいが、下げすぎると顎が出る。
         "offset_y": 0.0,
+        # 検出が途切れたとき、直前の位置から外挿し続ける長さ。
         "hold_sec": 0.7,
         "detect_width": 640,
-        "detect_every_n_frames": 1,
-        "low_score_warn": 0.75,
+        # 前後これだけのフレームの箱を取り込む（素朴な保険）。0 で無効。
+        # 補間・外挿が効いているぶん、ここは小さくてよい。大きくすると
+        # 動く人の軌跡ぜんぶを覆うことになり、過剰マスクが急に増える。
+        "dilate_frames": 2,
+        # 推定の不確かさを箱の大きさで吸収する強さ。
+        # 広げる半径[px] = expand_per_velocity × 速度[px/秒] × 経過[秒]
+        "expand_per_velocity": 0.5,
+        # 広げる上限（倍）。ここに達した箱は「位置を保証できない」印が付き、
+        # uncovered_policy の判断に回る。
+        "expand_limit": 4.0,
+        # 覆えないフレームの扱い: expand / cut / warn（ぼかしは使わない）
+        "uncovered_policy": "expand",
     },
     "encode": {
         "crf": 20,
@@ -109,6 +124,23 @@ def _strip_comments(text: str) -> str:
         out.append(ch)
         i += 1
     return "".join(out)
+
+
+def _unknown_keys(loaded: Dict[str, Any], defaults: Dict[str, Any], prefix: str = "") -> list[str]:
+    """既定に無いキーを、ネストの中まで再帰的に探す。
+
+    最上位しか見ないと "mask": {"score_treshold": ...} のような綴り間違いが
+    黙って無視される。この設定は「隠し漏れがあったら閾値を下げろ」と README が
+    指示する、最も打鍵される項目なので、間違いは必ずエラーにする。
+    """
+    result: list[str] = []
+    for key, value in loaded.items():
+        path = f"{prefix}{key}"
+        if key not in defaults:
+            result.append(path)
+        elif isinstance(value, dict) and isinstance(defaults[key], dict):
+            result.extend(_unknown_keys(value, defaults[key], prefix=f"{path}."))
+    return result
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -182,7 +214,7 @@ def load_config(path: str | Path | None) -> Config:
     if not isinstance(loaded, dict):
         raise ConfigError(f"設定ファイルの最上位はオブジェクトである必要があります: {config_path}")
 
-    unknown = set(loaded) - set(DEFAULTS)
+    unknown = _unknown_keys(loaded, DEFAULTS)
     if unknown:
         raise ConfigError(
             "設定ファイルに未知のキーがあります: "

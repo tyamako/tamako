@@ -65,6 +65,10 @@ def fit_filters(
     return filters
 
 
+# 精密トリムの前に置く粗いシークの余裕。キーフレーム間隔より十分大きくとる。
+_COARSE_SEEK_MARGIN = 2.0
+
+
 def read_frames(
     path: str | Path,
     *,
@@ -74,23 +78,43 @@ def read_frames(
     filters: Sequence[str] = (),
     start: Optional[float] = None,
     duration: Optional[float] = None,
+    expected_frames: Optional[int] = None,
 ) -> tuple[FrameStream, Iterator[np.ndarray]]:
     """動画を BGR フレームの列として読み出す。
 
     出力の大きさは呼び出し側が filters と併せて決める。間引きや拡縮を ffmpeg
     側でやってしまうほうが、復号ごと省けて速い。
+
+    時刻の精密さについて: -ss を -i の前に置くだけだと、シークの着地点と
+    フィルタの位相が区間ごとに揺れ、出力フレームと素材時刻の対応が最大
+    1 フレームずれる。人手修正の記録（素材時刻を指す）がその上に載るので、
+    -ss は 2 秒手前への粗いシークに限定し、精密な切り出しは trim フィルタで行う。
+
+    expected_frames を与えると、必ずその枚数を返す。足りない分は最終フレームの
+    複製で埋め、余った分は読み捨てる。区間のフレーム数を round(duration×fps) で
+    先に確定させる timeline の契約（音ズレ防止）の映像側の実装がこれ。
     """
     out_w, out_h = out_width, out_height
 
     cmd = [find_ffmpeg(), "-hide_banner", "-loglevel", "error"]
-    # -ss を -i の前に置くと、ffmpeg が復号を飛ばしつつ再符号化時は正確に合わせる。
+    pre_filters: list[str] = []
     if start is not None and start > 0:
-        cmd += ["-ss", f"{start:.6f}"]
+        coarse = max(0.0, start - _COARSE_SEEK_MARGIN)
+        if coarse > 0:
+            cmd += ["-ss", f"{coarse:.6f}"]
+        trim_start = start - coarse
+        if duration is not None:
+            pre_filters.append(f"trim=start={trim_start:.6f}:end={trim_start + duration:.6f}")
+        else:
+            pre_filters.append(f"trim=start={trim_start:.6f}")
+        pre_filters.append("setpts=PTS-STARTPTS")
+    elif duration is not None:
+        pre_filters.append(f"trim=end={duration:.6f}")
+        pre_filters.append("setpts=PTS-STARTPTS")
     cmd += ["-i", str(path)]
-    if duration is not None:
-        cmd += ["-t", f"{duration:.6f}"]
-    if filters:
-        cmd += ["-vf", ",".join(filters)]
+    all_filters = pre_filters + list(filters)
+    if all_filters:
+        cmd += ["-vf", ",".join(all_filters)]
     cmd += ["-an", "-sn", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
 
     stream = FrameStream(width=out_w, height=out_h, fps=fps)
@@ -99,21 +123,56 @@ def read_frames(
         frame_bytes = out_w * out_h * 3
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert proc.stdout is not None
+        produced = 0
+        last: Optional[np.ndarray] = None
+        closed_cleanly = False
         try:
             while True:
-                buffer = proc.stdout.read(frame_bytes)
-                if not buffer or len(buffer) < frame_bytes:
+                if expected_frames is not None and produced >= expected_frames:
+                    proc.kill()
                     break
-                yield np.frombuffer(buffer, dtype=np.uint8).reshape(out_h, out_w, 3)
-        finally:
+                buffer = proc.stdout.read(frame_bytes)
+                if not buffer:
+                    break
+                if len(buffer) < frame_bytes:
+                    # 端数は「たまたま短い動画」ではなく復号の失敗。黙って
+                    # 捨てると以降の全フレームの時刻がずれるので、必ず落とす。
+                    raise FFmpegError(
+                        f"フレームが途中で切れました ({path}): "
+                        f"{len(buffer)}/{frame_bytes} バイト"
+                    )
+                last = np.frombuffer(buffer, dtype=np.uint8).reshape(out_h, out_w, 3)
+                produced += 1
+                yield last
+
+            # ループを自力で抜けた。プロセスを畳み、成否を検査してから枚数を揃える。
+            killed = expected_frames is not None and produced >= expected_frames
             proc.stdout.close()
             stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
             if proc.stderr:
                 proc.stderr.close()
             code = proc.wait()
-            # 途中で読むのをやめた場合は SIGPIPE 相当で落ちるため、それは無視する。
-            if code not in (0, None) and "Broken pipe" not in stderr and stderr.strip():
-                raise FFmpegError(f"フレーム読み出しに失敗しました ({path}): {stderr.strip()[:500]}")
+            closed_cleanly = True
+            # 自分で止めた場合以外の異常終了は、stderr が空でも失敗として扱う。
+            if not killed and code not in (0, None):
+                detail = stderr.strip()[:500] or f"終了コード {code}"
+                raise FFmpegError(f"フレーム読み出しに失敗しました ({path}): {detail}")
+            if expected_frames is not None and produced < expected_frames:
+                if last is None:
+                    raise FFmpegError(f"フレームを 1 枚も読めませんでした ({path})")
+                # 復号器の丸めで 1 枚足りないことがある。時間の権威はフレーム数の
+                # 側なので、最終フレームを複製して枚数を合わせる。
+                for _ in range(expected_frames - produced):
+                    yield last
+        finally:
+            # 例外や消費側の中断で抜けた場合の畳み方。ここでは例外を出さない。
+            if not closed_cleanly:
+                proc.kill()
+                if proc.stdout and not proc.stdout.closed:
+                    proc.stdout.close()
+                if proc.stderr and not proc.stderr.closed:
+                    proc.stderr.close()
+                proc.wait()
 
     return stream, generate()
 
